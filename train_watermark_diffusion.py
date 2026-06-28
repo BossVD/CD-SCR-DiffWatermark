@@ -372,6 +372,7 @@ def default_config():
             'lambda_diff': 1.0,
             'lambda_img': 1.0,
             'lambda_wm': 5.0,
+            'lambda_delta': 0.0,
             'use_loss_schedule': False,
             'loss_schedule': [],
             'save_interval': 2,
@@ -640,6 +641,7 @@ def train(config):
     # --- Timestep config ---
     wm_t_min = cfg['diffusion']['wm_t_min']
     wm_t_max = cfg['diffusion']['wm_t_max']
+    lambda_delta = float(cfg['train'].get('lambda_delta', 0.0))
     train_t_start = cfg['diffusion']['train_t_start']
 
     # --- Training state ---
@@ -656,7 +658,7 @@ def train(config):
     train_csv = open(train_log_path, csv_mode, newline='')
     train_writer = csv.DictWriter(train_csv, fieldnames=[
         'epoch', 'global_step', 'loss_total', 'loss_diff', 'loss_img', 'loss_wm',
-        'bit_acc', 'psnr', 'lr', 'noise_layer_type',
+        'loss_delta', 'bit_acc', 'psnr', 'lr', 'noise_layer_type',
     ])
     if not os.path.exists(train_log_path) or os.path.getsize(train_log_path) == 0:
         train_writer.writeheader()
@@ -679,6 +681,7 @@ def train(config):
         f"[Train] initial lambda_diff={initial_lambda_diff}, "
         f"lambda_img={initial_lambda_img}, lambda_wm={initial_lambda_wm}"
     )
+    print(f"[Train] lambda_delta={lambda_delta}")
     if cfg['train'].get('use_loss_schedule', False):
         print(f"[Train] loss schedule enabled: {cfg['train'].get('loss_schedule', [])}")
     print(f"[Train] wm_t range: [{wm_t_min}, {wm_t_max}), noise_layer={noise_type}")
@@ -754,6 +757,7 @@ def train(config):
 
                 # Image fidelity loss in [-1, 1]
                 loss_img = F.l1_loss(pred_x0, cover_img)
+                loss_delta = (pred_x0 - cover_img).abs().mean()
 
                 # Unified degradation layers use [0, 1].
                 pred_x0_01 = (pred_x0 + 1.0) / 2.0
@@ -774,7 +778,11 @@ def train(config):
             # ========================================================
             # 3. Total loss
             # ========================================================
-            watermark_objective = lambda_img * loss_img + lambda_wm * loss_wm
+            watermark_objective = (
+                lambda_img * loss_img
+                + lambda_wm * loss_wm
+                + lambda_delta * loss_delta
+            )
 
             # ========================================================
             # 4. Backward
@@ -808,6 +816,7 @@ def train(config):
                 lambda_diff * loss_diff
                 + lambda_img * loss_img.detach()
                 + lambda_wm * loss_wm.detach()
+                + lambda_delta * loss_delta.detach()
             )
 
             # ========================================================
@@ -831,6 +840,7 @@ def train(config):
                     'loss_diff': loss_diff.item(),
                     'loss_img': loss_img.item(),
                     'loss_wm': loss_wm.item(),
+                    'loss_delta': loss_delta.item(),
                     'bit_acc': bit_acc,
                     'psnr': psnr_val,
                     'lr': optimizer.param_groups[0]['lr'],
@@ -842,8 +852,10 @@ def train(config):
                 print(
                     f"[E{epoch:03d}|S{global_step:06d}] "
                     f"L={loss_total.item():.4f} "
-                    f"(diff={loss_diff.item():.4f} img={loss_img.item():.4f} wm={loss_wm.item():.4f}) "
+                    f"(diff={loss_diff.item():.4f} img={loss_img.item():.4f} "
+                    f"wm={loss_wm.item():.4f} delta={loss_delta.item():.4f}) "
                     f"lambda=({lambda_diff:.2f},{lambda_img:.2f},{lambda_wm:.2f}) "
+                    f"lambda_delta={lambda_delta:.2f} "
                     f"bit_acc={bit_acc:.3f} PSNR={psnr_val:.1f} "
                     f"noise_layer={noise_type}"
                 )

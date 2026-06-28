@@ -24,7 +24,7 @@ def main():
     parser.add_argument("--output_dir", default="outputs/noise_layer_debug")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--image_size", type=int, default=None)
-    parser.add_argument("--projector_samples", type=int, default=8)
+    parser.add_argument("--projector_samples", type=int, default=4)
     args = parser.parse_args()
 
     with open(args.config, "r", encoding="utf-8-sig") as handle:
@@ -49,11 +49,17 @@ def main():
     # Mixed only selects one concrete layer per call. Showing it here would
     # duplicate a randomly re-sampled PIMoG or Projector result and make the
     # visual comparison ambiguous.
-    for noise_type in ("pimog", "projector"):
+    for noise_type in ("pimog", "oled", "led", "projector"):
         test_cfg = dict(cfg)
         test_cfg["noise_layer"] = dict(cfg.get("noise_layer", {}), type=noise_type)
         test_cfg["noise_layer"]["pimog"] = dict(
             cfg.get("noise_layer", {}).get("pimog", {}), p=1.0
+        )
+        test_cfg["noise_layer"]["oled"] = dict(
+            cfg.get("noise_layer", {}).get("oled", {}), p=1.0
+        )
+        test_cfg["noise_layer"]["led"] = dict(
+            cfg.get("noise_layer", {}).get("led", {}), p=1.0
         )
         test_cfg["noise_layer"]["projector"] = dict(
             cfg.get("noise_layer", {}).get("projector", {}), p=1.0

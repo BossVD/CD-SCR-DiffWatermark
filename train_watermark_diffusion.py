@@ -383,8 +383,11 @@ def train(config):
     use_noise_layer = noise_type != 'none'
     print(f"[NoiseLayer] type: {noise_type}")
     if noise_type == 'mixed':
-        mixed_probs = cfg.get('noise_layer', {}).get('mixed_probs', [0.5, 0.5])
-        print("[NoiseLayer] layers: PIMoG, Projector")
+        noise_cfg = cfg.get('noise_layer', {})
+        mixed_cfg = noise_cfg.get('mixed', {})
+        mixed_candidates = mixed_cfg.get('candidates', ['pimog', 'projector'])
+        mixed_probs = mixed_cfg.get('probs', noise_cfg.get('mixed_probs', [0.5, 0.5]))
+        print(f"[NoiseLayer] layers: {', '.join(mixed_candidates)}")
         print(f"[NoiseLayer] probs: {mixed_probs}")
     elif use_noise_layer:
         print(f"[NoiseLayer] {noise_layer.__class__.__name__} enabled")

@@ -5,6 +5,8 @@ import torch.nn as nn
 
 from .PIMoG_Layer import PIMoGLayer
 from .Projector_Layer import ProjectorSimulator
+from .OLED_Layer import OLEDNoiseLayer
+from .LED_Layer import LEDNoiseLayer
 
 
 class MixedNoiseLayer(nn.Module):
@@ -34,26 +36,44 @@ def get_noise_layer_type(config):
     return str(config.get("noise_layer", {}).get("type", "none")).lower()
 
 
+def _build_single_noise_layer(noise_type, noise_cfg):
+    """Build one concrete degradation layer from the ``noise_layer`` section."""
+    if noise_type == "pimog":
+        return PIMoGLayer(**noise_cfg.get("pimog", {}))
+    if noise_type == "oled":
+        return OLEDNoiseLayer(**noise_cfg.get("oled", {}))
+    if noise_type == "led":
+        return LEDNoiseLayer(**noise_cfg.get("led", {}))
+    if noise_type == "projector":
+        return ProjectorSimulator(**noise_cfg.get("projector", {}))
+    raise ValueError(f"Unsupported mixed noise layer candidate: {noise_type}")
+
+
 def build_noise_layer(config):
-    """Build ``none``, ``pimog``, ``projector``, or ``mixed`` from a config dict."""
+    """Build ``none``, concrete screen layers, or ``mixed`` from a config dict."""
     noise_cfg = config.get("noise_layer", {})
     noise_type = get_noise_layer_type(config)
 
     if noise_type == "none":
         return nn.Identity()
-    if noise_type == "pimog":
-        return PIMoGLayer(**noise_cfg.get("pimog", {}))
-    if noise_type == "projector":
-        return ProjectorSimulator(**noise_cfg.get("projector", {}))
+    if noise_type in {"pimog", "oled", "led", "projector"}:
+        return _build_single_noise_layer(noise_type, noise_cfg)
     if noise_type == "mixed":
+        mixed_cfg = noise_cfg.get("mixed", {})
+        candidates = mixed_cfg.get("candidates", None)
+        if candidates is None:
+            # Backward compatible default for existing configs with
+            # mixed_probs: [pimog_prob, projector_prob].
+            candidates = ["pimog", "projector"]
+            probs = noise_cfg.get("mixed_probs", [0.5, 0.5])
+        else:
+            candidates = [str(candidate).lower() for candidate in candidates]
+            probs = mixed_cfg.get("probs", noise_cfg.get("mixed_probs", None))
         return MixedNoiseLayer(
-            layers=[
-                PIMoGLayer(**noise_cfg.get("pimog", {})),
-                ProjectorSimulator(**noise_cfg.get("projector", {})),
-            ],
-            probs=noise_cfg.get("mixed_probs", [0.5, 0.5]),
+            layers=[_build_single_noise_layer(candidate, noise_cfg) for candidate in candidates],
+            probs=probs,
         )
     raise ValueError(
-        f"Unknown noise layer type: {noise_type}. "
-        "Expected one of: none, pimog, projector, mixed"
+        f"Unsupported noise layer type: {noise_type}. "
+        "Expected one of: none, pimog, oled, led, projector, mixed"
     )

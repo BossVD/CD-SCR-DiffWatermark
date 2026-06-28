@@ -16,7 +16,7 @@ KEY DEBUG POINTS if bit_acc ~ 0.5:
   6. Check wm_t_max is not too large
 
 Usage:
-    D:\Anaconda_envs\envs\wadiff\python.exe train_watermark_diffusion.py --config configs/watermark_diffusion.yaml
+    D:\Anaconda_envs\envs\wadiff\python.exe train_watermark_diffusion.py --config configs/watermark_stage1.yaml
 r"""
 import os
 import sys

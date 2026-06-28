@@ -11,7 +11,7 @@ All Python commands must run under the **WaDiff** conda environment.
 
 - Use the full Python path for running scripts:
   ```
-  D:\Anaconda_envs\envs\wadiff\python.exe train_watermark_diffusion.py --config configs/watermark_diffusion.yaml
+  D:\Anaconda_envs\envs\wadiff\python.exe train_watermark_diffusion.py --config configs/watermark_stage1.yaml
   ```
 - Use the full pip path for installing packages:
   ```

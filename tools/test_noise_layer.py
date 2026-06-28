@@ -20,7 +20,7 @@ from NOISE_LAYER.build_noise_layer import build_noise_layer
 def main():
     parser = argparse.ArgumentParser(description="Test degradation layers")
     parser.add_argument("--input", default=None, help="Optional sample image path")
-    parser.add_argument("--config", default="configs/watermark_diffusion.yaml")
+    parser.add_argument("--config", default="configs/watermark_stage2_mixed.yaml")
     parser.add_argument("--output_dir", default="outputs/noise_layer_debug")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--image_size", type=int, default=None)

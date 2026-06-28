@@ -62,19 +62,47 @@ COCO 2017 数据集目录结构：
 python train_watermark_diffusion.py --config configs/watermark_stage1.yaml
 ```
 
-关键观测指标：`bit_acc_clean` 应显著高于 0.5 并逐步达到 0.85+，`loss_wm` 持续下降，`PSNR` 稳定。
+Stage 1 默认启用两条水印注入路径：
+
+- `wm_bits -> wm_emb -> time embedding`：全局水印条件，保留原有路径。
+- `wm_bits -> wm_map -> UNet input`：空间水印条件，先投影为低分辨率 map，再上采样并拼接到 UNet 输入通道。
+
+当前 decoder 固定使用默认的 residual multi-scale decoder，输出仍为 raw logits，训练继续使用 `BCEWithLogitsLoss`。
+
+关键观测指标：`bit_acc_clean` 应显著高于 0.5 并逐步达到 0.85+，`loss_wm` 持续下降，`PSNR` 稳定。训练日志会输出 logits 统计、梯度范数和 `pred_x0_delta_same_cover_diff_wm`，用于判断模型是否真的使用 `wm_bits`。
 
 ### Stage 1 配置要点
 
 对应配置文件：`configs/watermark_stage1.yaml`
 
 ```yaml
+model:
+  use_watermark_time_emb: true
+  use_watermark_spatial_map: true
+  wm_map_channels: 4
+  wm_map_size: 16
+  wm_time_scale: 1.0
+  wm_map_scale: 1.0
 noise_layer:
   type: none             # 关闭所有退化层
 train:
   lr: 0.0001
   lambda_wm: 5.0
   epochs: 50
+  use_loss_schedule: true
+  loss_schedule:
+    - until_step: 2000
+      lambda_diff: 0.0
+      lambda_img: 0.2
+      lambda_wm: 10.0
+    - until_step: 5000
+      lambda_diff: 0.5
+      lambda_img: 0.5
+      lambda_wm: 8.0
+    - until_step: -1
+      lambda_diff: 1.0
+      lambda_img: 1.0
+      lambda_wm: 5.0
 decoder:
   type: residual_multiscale
   base_channels: 32
@@ -90,6 +118,14 @@ output:
   checkpoint_dir: ./checkpoints_stage1
   sample_dir: ./outputs_stage1/samples
   log_dir: ./outputs_stage1/logs
+```
+
+启用 `wm_map_channels=4` 后，UNet 输入通道从 `x_t + cover_img = 6` 变为 `x_t + cover_img + wm_map = 10`，输出仍为 3 通道噪声预测。
+
+Shape smoke test:
+
+```bash
+python tools/test_wm_map_forward.py
 ```
 
 ---

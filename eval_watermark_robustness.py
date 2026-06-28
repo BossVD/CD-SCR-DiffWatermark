@@ -175,6 +175,12 @@ def main():
         base_channels=base_channels,
         cond_dim=cond_dim,
         watermark_length=watermark_length,
+        use_watermark_time_emb=cfg.get('model', {}).get('use_watermark_time_emb', True),
+        use_watermark_spatial_map=cfg.get('model', {}).get('use_watermark_spatial_map', True),
+        wm_map_channels=cfg.get('model', {}).get('wm_map_channels', 4),
+        wm_map_size=cfg.get('model', {}).get('wm_map_size', 16),
+        wm_time_scale=cfg.get('model', {}).get('wm_time_scale', 1.0),
+        wm_map_scale=cfg.get('model', {}).get('wm_map_scale', 1.0),
     ).to(device)
 
     if 'diffusion_model' in checkpoint:

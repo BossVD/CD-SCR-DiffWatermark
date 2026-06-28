@@ -56,6 +56,36 @@ def compute_psnr(pred, target, max_val=1.0):
         return 100.0
     return (20 * math.log10(max_val) - 10 * math.log10(mse.item()))
 
+
+def get_loss_weights(cfg, global_step):
+    train_cfg = cfg.get('train', {})
+    if train_cfg.get('use_loss_schedule', False):
+        for item in train_cfg.get('loss_schedule', []):
+            until_step = int(item.get('until_step', -1))
+            if until_step < 0 or global_step < until_step:
+                return (
+                    float(item.get('lambda_diff', train_cfg['lambda_diff'])),
+                    float(item.get('lambda_img', train_cfg['lambda_img'])),
+                    float(item.get('lambda_wm', train_cfg['lambda_wm'])),
+                )
+    return (
+        float(train_cfg['lambda_diff']),
+        float(train_cfg['lambda_img']),
+        float(train_cfg['lambda_wm']),
+    )
+
+
+def grad_norm(module):
+    total = 0.0
+    has_grad = False
+    for param in module.parameters():
+        if param.grad is None:
+            continue
+        param_norm = param.grad.detach().float().norm(2).item()
+        total += param_norm * param_norm
+        has_grad = True
+    return math.sqrt(total) if has_grad else float('nan')
+
 # ============================================================
 # Helper: predict x0 from noise prediction
 # ============================================================
@@ -174,6 +204,60 @@ def load_decoder_checkpoint(decoder, decoder_state, log_prefix):
     print(f"{log_prefix} Mismatched keys: {mismatched}")
 
 
+def load_model_state_for_init(model, checkpoint_state):
+    current_state = model.state_dict()
+    load_state = dict(current_state)
+    missing_keys = []
+    unexpected_keys = []
+    shape_mismatch_keys = []
+    copied_first_conv = False
+
+    for key, value in checkpoint_state.items():
+        if key not in current_state:
+            unexpected_keys.append(key)
+            continue
+
+        current_value = current_state[key]
+        if current_value.shape == value.shape:
+            load_state[key] = value
+            continue
+
+        shape_mismatch_keys.append(
+            f"{key}: checkpoint={tuple(value.shape)}, current={tuple(current_value.shape)}"
+        )
+        if (
+            key.endswith('input_blocks.0.0.weight')
+            and value.ndim == 4
+            and current_value.ndim == 4
+            and value.shape[0] == current_value.shape[0]
+            and value.shape[2:] == current_value.shape[2:]
+            and value.shape[1] < current_value.shape[1]
+        ):
+            new_weight = current_value.clone()
+            new_weight[:, :value.shape[1], :, :] = value
+            new_weight[:, value.shape[1]:, :, :] = 0.0
+            load_state[key] = new_weight
+            copied_first_conv = True
+            print(
+                "[Init] Detected input channel mismatch in first conv: "
+                f"checkpoint={value.shape[1]}, current={current_value.shape[1]}."
+            )
+            print("[Init] Copied old x_t and cover_img channels.")
+            print("[Init] Initialized new wm_map channels.")
+
+    for key in current_state:
+        if key not in checkpoint_state:
+            missing_keys.append(key)
+
+    model.load_state_dict(load_state, strict=True)
+    print("[Init] Loaded compatible diffusion model weights.")
+    print(f"[Init] Missing model keys: {missing_keys}")
+    print(f"[Init] Unexpected model keys: {unexpected_keys}")
+    print(f"[Init] Shape mismatch model keys: {shape_mismatch_keys}")
+    if not copied_first_conv and shape_mismatch_keys:
+        print("[Init] Shape-mismatched tensors kept at current initialization.")
+
+
 def resume_training(checkpoint_path, model, decoder, optimizer, scaler,
                     train_generator, device):
     if not os.path.exists(checkpoint_path):
@@ -181,7 +265,13 @@ def resume_training(checkpoint_path, model, decoder, optimizer, scaler,
 
     print(f"[Resume] Resume training from: {checkpoint_path}")
     ckpt = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(_get_checkpoint_model_state(ckpt), strict=True)
+    try:
+        model.load_state_dict(_get_checkpoint_model_state(ckpt), strict=True)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "[Resume Error] Checkpoint model structure does not match current model.\n"
+            "Use --init_from if you want to initialize a new stage with changed architecture."
+        ) from exc
     print("[Resume] Loaded diffusion model.")
 
     if 'decoder' in ckpt:
@@ -215,7 +305,7 @@ def init_from_checkpoint(checkpoint_path, model, decoder, reset_decoder, device)
 
     print(f"[Init] Initialize new training stage from: {checkpoint_path}")
     ckpt = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(_get_checkpoint_model_state(ckpt), strict=True)
+    load_model_state_for_init(model, _get_checkpoint_model_state(ckpt))
     print("[Init] Loaded diffusion model weights.")
 
     if reset_decoder:
@@ -247,6 +337,12 @@ def default_config():
             'cond_dim': 256,
             'use_pretrained_unet': False,
             'pretrained_path': None,
+            'use_watermark_time_emb': True,
+            'use_watermark_spatial_map': True,
+            'wm_map_channels': 4,
+            'wm_map_size': 16,
+            'wm_time_scale': 1.0,
+            'wm_map_scale': 1.0,
         },
         'decoder': {
             'type': 'residual_multiscale',
@@ -276,6 +372,8 @@ def default_config():
             'lambda_diff': 1.0,
             'lambda_img': 1.0,
             'lambda_wm': 5.0,
+            'use_loss_schedule': False,
+            'loss_schedule': [],
             'save_interval': 2,
             'sample_interval': 5000,
             'log_interval': 100,
@@ -466,6 +564,12 @@ def train(config):
         watermark_length=watermark_length,
         use_pretrained_unet=model_cfg['use_pretrained_unet'],
         pretrained_path=model_cfg['pretrained_path'],
+        use_watermark_time_emb=model_cfg.get('use_watermark_time_emb', True),
+        use_watermark_spatial_map=model_cfg.get('use_watermark_spatial_map', True),
+        wm_map_channels=model_cfg.get('wm_map_channels', 4),
+        wm_map_size=model_cfg.get('wm_map_size', 16),
+        wm_time_scale=model_cfg.get('wm_time_scale', 1.0),
+        wm_map_scale=model_cfg.get('wm_map_scale', 1.0),
     ).to(device)
 
     # --- Watermark Decoder ---
@@ -531,9 +635,7 @@ def train(config):
         )
 
     # --- Loss weights ---
-    lambda_diff = cfg['train']['lambda_diff']
-    lambda_img = cfg['train']['lambda_img']
-    lambda_wm = cfg['train']['lambda_wm']
+    initial_lambda_diff, initial_lambda_img, initial_lambda_wm = get_loss_weights(cfg, 0)
 
     # --- Timestep config ---
     wm_t_min = cfg['diffusion']['wm_t_min']
@@ -569,7 +671,12 @@ def train(config):
 
     # --- Training loop ---
     print(f"[Train] Starting training: {epochs} epochs, log_interval={log_interval}")
-    print(f"[Train] lambda_diff={lambda_diff}, lambda_img={lambda_img}, lambda_wm={lambda_wm}")
+    print(
+        f"[Train] initial lambda_diff={initial_lambda_diff}, "
+        f"lambda_img={initial_lambda_img}, lambda_wm={initial_lambda_wm}"
+    )
+    if cfg['train'].get('use_loss_schedule', False):
+        print(f"[Train] loss schedule enabled: {cfg['train'].get('loss_schedule', [])}")
     print(f"[Train] wm_t range: [{wm_t_min}, {wm_t_max}), noise_layer={noise_type}")
 
     for epoch in range(start_epoch, epochs + 1):
@@ -583,6 +690,7 @@ def train(config):
             wm_bits = batch['wm_bits'].to(device)    # [B, wm_len], 0/1 float
             B = cover_img.size(0)
             optimizer.zero_grad(set_to_none=True)
+            lambda_diff, lambda_img, lambda_wm = get_loss_weights(cfg, global_step)
 
             # ========================================================
             # Official PIMoG is either fully enabled or disabled.
@@ -610,10 +718,11 @@ def train(config):
             # Backpropagate this branch immediately so its large U-Net
             # activation graph is released before the watermark branch.
             diffusion_objective = lambda_diff * loss_diff
-            if scaler is not None:
-                scaler.scale(diffusion_objective).backward()
-            else:
-                diffusion_objective.backward()
+            if lambda_diff > 0:
+                if scaler is not None:
+                    scaler.scale(diffusion_objective).backward()
+                else:
+                    diffusion_objective.backward()
             loss_diff = loss_diff.detach()
             del pred_noise, diffusion_objective, x_t_diff
 
@@ -654,6 +763,9 @@ def train(config):
                 loss_wm = F.binary_cross_entropy_with_logits(
                     pred_logits, wm_bits.float()
                 )
+                logits_mean = pred_logits.detach().mean().item()
+                logits_std = pred_logits.detach().std().item()
+                sigmoid_mean = torch.sigmoid(pred_logits.detach()).mean().item()
 
             # ========================================================
             # 3. Total loss
@@ -665,10 +777,27 @@ def train(config):
             # ========================================================
             if scaler is not None:
                 scaler.scale(watermark_objective).backward()
+                scaler.unscale_(optimizer)
+                model_gn = grad_norm(model)
+                decoder_gn = grad_norm(decoder)
+                wm_mlp_gn = grad_norm(model.watermark_mlp)
+                wm_map_mlp_gn = (
+                    grad_norm(model.watermark_map_mlp)
+                    if hasattr(model, 'watermark_map_mlp')
+                    else float('nan')
+                )
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 watermark_objective.backward()
+                model_gn = grad_norm(model)
+                decoder_gn = grad_norm(decoder)
+                wm_mlp_gn = grad_norm(model.watermark_mlp)
+                wm_map_mlp_gn = (
+                    grad_norm(model.watermark_map_mlp)
+                    if hasattr(model, 'watermark_map_mlp')
+                    else float('nan')
+                )
                 optimizer.step()
 
             loss_total = (
@@ -691,6 +820,34 @@ def train(config):
             # 6. Logging
             # ========================================================
             if global_step % log_interval == 0:
+                with torch.no_grad():
+                    debug_count = min(2, B)
+                    debug_x_t = x_t_wm[:debug_count]
+                    debug_t = t_wm[:debug_count]
+                    debug_t_scaled = t_wm_scaled[:debug_count]
+                    debug_cover = cover_img[:debug_count]
+                    debug_wm_a = wm_bits[:debug_count]
+                    debug_wm_b = 1.0 - debug_wm_a
+                    pred_noise_a = model(
+                        x_t=debug_x_t,
+                        t=debug_t_scaled,
+                        cover_img=debug_cover,
+                        wm_bits=debug_wm_a,
+                    )
+                    pred_noise_b = model(
+                        x_t=debug_x_t,
+                        t=debug_t_scaled,
+                        cover_img=debug_cover,
+                        wm_bits=debug_wm_b,
+                    )
+                    pred_x0_a = predict_start_from_noise(
+                        diffusion, debug_x_t, debug_t, pred_noise_a
+                    )
+                    pred_x0_b = predict_start_from_noise(
+                        diffusion, debug_x_t, debug_t, pred_noise_b
+                    )
+                    pred_x0_delta = (pred_x0_a - pred_x0_b).abs().mean().item()
+
                 log_data = {
                     'epoch': epoch,
                     'global_step': global_step,
@@ -710,8 +867,21 @@ def train(config):
                     f"[E{epoch:03d}|S{global_step:06d}] "
                     f"L={loss_total.item():.4f} "
                     f"(diff={loss_diff.item():.4f} img={loss_img.item():.4f} wm={loss_wm.item():.4f}) "
+                    f"lambda=({lambda_diff:.2f},{lambda_img:.2f},{lambda_wm:.2f}) "
                     f"bit_acc={bit_acc:.3f} PSNR={psnr_val:.1f} "
                     f"noise_layer={noise_type}"
+                )
+                print(
+                    f"[Debug] logits_mean={logits_mean:.4f} "
+                    f"logits_std={logits_std:.4f} "
+                    f"sigmoid_mean={sigmoid_mean:.4f} "
+                    f"pred_x0_delta_same_cover_diff_wm={pred_x0_delta:.6f}"
+                )
+                print(
+                    f"[Debug] model_gn={model_gn:.4f} "
+                    f"decoder_gn={decoder_gn:.4f} "
+                    f"wm_mlp_gn={wm_mlp_gn:.4f} "
+                    f"wm_map_mlp_gn={wm_map_mlp_gn:.4f}"
                 )
 
             # ========================================================

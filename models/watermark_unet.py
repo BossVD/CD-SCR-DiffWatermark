@@ -8,8 +8,9 @@ Extends the original guided-diffusion UNet to accept:
   - wm_bits:     watermark bits [B, wm_length] as condition
 
 Condition injection:
-  - cover_img:   channel-wise concatenation with x_t -> [B, 6, H, W]
+  - cover_img:   channel-wise concatenation with x_t
   - wm_bits:     MLP embedding + addition to time embedding
+  - wm_map:      spatial watermark map concatenated into UNet input channels
 
 *** IMPORTANT: Reinitializes all zero_module convs in ResBlocks
     to Xavier init. The original DDPM uses zero_module which blocks
@@ -45,6 +46,12 @@ class WatermarkConditionedUNet(nn.Module):
         watermark_length=64,
         use_pretrained_unet=False,
         pretrained_path=None,
+        use_watermark_time_emb=True,
+        use_watermark_spatial_map=True,
+        wm_map_channels=4,
+        wm_map_size=16,
+        wm_time_scale=1.0,
+        wm_map_scale=1.0,
         **unet_kwargs,
     ):
         super().__init__()
@@ -52,20 +59,36 @@ class WatermarkConditionedUNet(nn.Module):
         self.image_size = image_size
         self.watermark_length = watermark_length
         self.cond_dim = cond_dim
+        self.use_watermark_time_emb = use_watermark_time_emb
+        self.use_watermark_spatial_map = use_watermark_spatial_map
+        self.wm_map_channels = wm_map_channels
+        self.wm_map_size = wm_map_size
+        self.wm_time_scale = wm_time_scale
+        self.wm_map_scale = wm_map_scale
 
-        # --- Watermark MLP: wm_bits -> embedding ---
+        # --- Watermark MLP: wm_bits -> global embedding ---
         self.watermark_mlp = nn.Sequential(
             nn.Linear(watermark_length, cond_dim),
             nn.SiLU(),
             nn.Linear(cond_dim, cond_dim),
         )
 
+        # --- Watermark map MLP: wm_bits -> spatial condition map ---
+        self.watermark_map_mlp = nn.Sequential(
+            nn.Linear(watermark_length, 256),
+            nn.SiLU(),
+            nn.Linear(256, wm_map_channels * wm_map_size * wm_map_size),
+        )
+
         # --- Inner UNet ---
-        # in_channels=6 for x_t + cover_img concatenation
+        # in_channels=6 for x_t + cover_img, optionally plus wm_map channels.
         # wm_length=0 disables built-in watermark path
+        unet_in_channels = 6
+        if use_watermark_spatial_map:
+            unet_in_channels += wm_map_channels
         default_unet_kwargs = dict(
             image_size=image_size,
-            in_channels=6,
+            in_channels=unet_in_channels,
             model_channels=base_channels,
             out_channels=3,
             num_res_blocks=2,
@@ -141,18 +164,25 @@ class WatermarkConditionedUNet(nn.Module):
         if 'model' in state_dict:
             state_dict = state_dict['model']
 
-        # Handle first conv layer: 3 -> 6 channels
+        # Handle first conv layer expansion to the current condition width.
         first_conv_key = 'input_blocks.0.0.weight'
         if first_conv_key in state_dict:
             old_weight = state_dict[first_conv_key]
-            if old_weight.shape[1] == 3:
-                new_weight = torch.zeros(
-                    old_weight.shape[0], 6,
-                    old_weight.shape[2], old_weight.shape[3]
-                )
-                new_weight[:, :3, :, :] = old_weight
+            current_weight = self.inner_unet.state_dict()[first_conv_key]
+            if (
+                old_weight.ndim == 4
+                and old_weight.shape[1] < current_weight.shape[1]
+                and old_weight.shape[0] == current_weight.shape[0]
+                and old_weight.shape[2:] == current_weight.shape[2:]
+            ):
+                new_weight = current_weight.clone()
+                new_weight[:, :old_weight.shape[1], :, :] = old_weight
+                new_weight[:, old_weight.shape[1]:, :, :] = 0.0
                 state_dict[first_conv_key] = new_weight
-                print("[WatermarkConditionedUNet] Expanded first conv from 3->6 input channels.")
+                print(
+                    "[WatermarkConditionedUNet] Expanded first conv from "
+                    f"{old_weight.shape[1]}->{current_weight.shape[1]} input channels."
+                )
 
         # Fix key mismatches
         unet_state = self.inner_unet.state_dict()
@@ -181,20 +211,42 @@ class WatermarkConditionedUNet(nn.Module):
         Returns:
             pred_noise: [B, 3, H, W]  predicted noise
         """
-        # 1. Channel concatenation of x_t and cover_img
-        model_input = torch.cat([x_t, cover_img], dim=1)  # [B, 6, H, W]
-
-        # 2. Compute time embedding
+        # 1. Compute time embedding
         from guided_diffusion.nn import timestep_embedding
         time_emb = self.inner_unet.time_embed(
             timestep_embedding(t, self.inner_unet.model_channels)
         )
 
-        # 3. Compute watermark embedding and fuse with time embedding
-        wm_emb = self.watermark_mlp(wm_bits)  # [B, cond_dim]
-        cond_emb = time_emb + wm_emb           # [B, time_embed_dim]
+        # 2. Optionally fuse watermark bits into the global time embedding.
+        wm_bits = wm_bits.float()
+        if self.use_watermark_time_emb:
+            wm_emb = self.watermark_mlp(wm_bits)  # [B, cond_dim]
+            cond_emb = time_emb + self.wm_time_scale * wm_emb
+        else:
+            cond_emb = time_emb
 
-        # 4. Pass through inner UNet with pre-fused conditions
+        # 3. Optionally add an explicit spatial watermark condition.
+        if self.use_watermark_spatial_map:
+            batch = x_t.shape[0]
+            wm_map = self.watermark_map_mlp(wm_bits)
+            wm_map = wm_map.view(
+                batch,
+                self.wm_map_channels,
+                self.wm_map_size,
+                self.wm_map_size,
+            )
+            wm_map = F.interpolate(
+                wm_map,
+                size=x_t.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+            wm_map = self.wm_map_scale * wm_map
+            model_input = torch.cat([x_t, cover_img, wm_map], dim=1)
+        else:
+            model_input = torch.cat([x_t, cover_img], dim=1)
+
+        # 4. Pass through inner UNet with pre-fused conditions.
         return self._inner_unet_forward(model_input, cond_emb)
 
     def _inner_unet_forward(self, x, emb):

@@ -184,6 +184,18 @@ python sample_embed_watermark.py \
 
 ---
 
+## 测试噪声层
+
+```powershell
+D:\Anaconda_envs\envs\wadiff\python.exe tools\test_noise_layer.py `
+  --input "D:\1_Pytorch_Project\WaDiff\tools\test.jpg" `
+  --config configs\watermark_stage1.yaml `
+  --image_size 256 `
+  --device cuda
+```
+
+---
+
 ## 屏摄鲁棒性评估
 
 ```bash

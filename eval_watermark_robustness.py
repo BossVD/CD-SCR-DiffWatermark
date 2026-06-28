@@ -28,7 +28,10 @@ from guided_diffusion.gaussian_diffusion import GaussianDiffusion, get_named_bet
 
 from dataset.watermark_image_dataset import WatermarkImageDataset
 from models.watermark_unet import WatermarkConditionedUNet
-from models.watermark_decoder import WatermarkDecoder
+from models.watermark_decoder import (
+    build_watermark_decoder,
+    load_watermark_decoder_state,
+)
 from NOISE_LAYER import build_noise_layer
 
 
@@ -142,9 +145,19 @@ def main():
         model.load_state_dict(checkpoint, strict=False)
     model.eval()
 
-    decoder = WatermarkDecoder(watermark_length=watermark_length).to(device)
+    decoder = build_watermark_decoder(
+        cfg,
+        watermark_length=watermark_length,
+    ).to(device)
     if 'decoder' in checkpoint:
-        decoder.load_state_dict(checkpoint['decoder'], strict=False)
+        missing, unexpected, mismatched = load_watermark_decoder_state(
+            decoder, checkpoint['decoder']
+        )
+        if missing or unexpected or mismatched:
+            print(
+                "[Eval] Decoder checkpoint partially loaded "
+                "(architecture may have changed)."
+            )
     decoder.eval()
 
     # --- Dataset ---

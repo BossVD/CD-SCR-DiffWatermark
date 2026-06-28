@@ -22,7 +22,10 @@ from torchvision.transforms.functional import center_crop, resize
 sys.path.insert(0, os.path.dirname(__file__))
 
 from models.watermark_unet import WatermarkConditionedUNet
-from models.watermark_decoder import WatermarkDecoder
+from models.watermark_decoder import (
+    build_watermark_decoder,
+    load_watermark_decoder_state,
+)
 
 
 def main():
@@ -55,8 +58,18 @@ def main():
     watermark_length = args.watermark_length or cfg.get('data', {}).get('watermark_length', 64)
 
     # --- Build decoder ---
-    decoder = WatermarkDecoder(watermark_length=watermark_length).to(device)
-    decoder.load_state_dict(ckpt['decoder'])
+    decoder = build_watermark_decoder(
+        cfg,
+        watermark_length=watermark_length,
+    ).to(device)
+    missing, unexpected, mismatched = load_watermark_decoder_state(
+        decoder, ckpt['decoder']
+    )
+    if missing or unexpected or mismatched:
+        print(
+            "[Eval] Decoder checkpoint partially loaded "
+            "(architecture may have changed)."
+        )
     decoder.eval()
 
     # --- Collect image files ---

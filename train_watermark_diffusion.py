@@ -40,7 +40,10 @@ from guided_diffusion.nn import mean_flat
 
 from dataset.watermark_image_dataset import WatermarkImageDataset
 from models.watermark_unet import WatermarkConditionedUNet
-from models.watermark_decoder import WatermarkDecoder
+from models.watermark_decoder import (
+    build_watermark_decoder,
+    load_watermark_decoder_state,
+)
 from NOISE_LAYER import build_noise_layer, get_noise_layer_type
 
 # ============================================================
@@ -130,6 +133,7 @@ def restore_random_state(state, train_generator):
         ]
         torch.cuda.set_rng_state_all(cuda_states)
 
+
 # ============================================================
 # Configuration loading
 # ============================================================
@@ -163,6 +167,14 @@ def default_config():
             'use_pretrained_unet': False,
             'pretrained_path': None,
         },
+        'decoder': {
+            'type': 'residual_multiscale',
+            'base_channels': 32,
+            'hidden_dim': 512,
+            'dropout': 0.1,
+            'norm_groups': 8,
+            'use_multiscale': True,
+        },
         'diffusion': {
             'timesteps': 1000,
             'beta_schedule': 'linear',
@@ -186,6 +198,7 @@ def default_config():
             'save_interval': 2,
             'sample_interval': 5000,
             'log_interval': 100,
+            'reset_decoder': False,
         },
         'noise_layer': {'type': 'none'},
         'output': {
@@ -375,7 +388,19 @@ def train(config):
     ).to(device)
 
     # --- Watermark Decoder ---
-    decoder = WatermarkDecoder(watermark_length=watermark_length).to(device)
+    decoder = build_watermark_decoder(
+        cfg,
+        watermark_length=watermark_length,
+    ).to(device)
+    decoder_cfg = cfg.get('decoder', {})
+    print(
+        "[Decoder] type={}, base_channels={}, hidden_dim={}, multiscale={}".format(
+            decoder_cfg.get('type', 'residual_multiscale'),
+            decoder_cfg.get('base_channels', 32),
+            decoder_cfg.get('hidden_dim', 512),
+            decoder_cfg.get('use_multiscale', True),
+        )
+    )
 
     # Unified layers consume and return [0, 1]. The diffusion model and
     # decoder retain their existing [-1, 1] contracts around this boundary.
@@ -412,8 +437,34 @@ def train(config):
         print(f"[Resume] Loading checkpoint from {resume_path}")
         ckpt = torch.load(resume_path, map_location=device)
         model.load_state_dict(ckpt['diffusion_model'])
-        decoder.load_state_dict(ckpt['decoder'])
-        optimizer.load_state_dict(ckpt['optimizer'])
+        reset_decoder = cfg['train'].get('reset_decoder', False)
+        if reset_decoder:
+            print("[Resume] reset_decoder=true, skip loading old decoder weights.")
+        elif 'decoder' in ckpt:
+            missing, unexpected, mismatched = load_watermark_decoder_state(
+                decoder, ckpt['decoder']
+            )
+            if missing or unexpected or mismatched:
+                print(
+                    "[Resume] Decoder structure changed, loaded compatible "
+                    "weights with strict=False."
+                )
+                print(f"[Resume] Missing decoder keys: {missing}")
+                print(f"[Resume] Unexpected decoder keys: {unexpected}")
+                print(f"[Resume] Mismatched decoder keys: {mismatched}")
+            else:
+                print("[Resume] Decoder weights loaded.")
+
+        if not reset_decoder and 'optimizer' in ckpt:
+            try:
+                optimizer.load_state_dict(ckpt['optimizer'])
+            except ValueError as exc:
+                print(
+                    "[Resume] Optimizer state is incompatible with the current "
+                    f"decoder; starting optimizer from scratch. Reason: {exc}"
+                )
+        elif reset_decoder:
+            print("[Resume] reset_decoder=true, start optimizer from scratch.")
         if scaler is not None and 'scaler' in ckpt:
             scaler.load_state_dict(ckpt['scaler'])
         start_epoch = ckpt['epoch'] + 1

@@ -1,0 +1,70 @@
+data:
+  train_dir: /root/autodl-tmp/datasets/train2017
+  val_dir: /root/autodl-tmp/datasets/val2017
+  image_size: 128
+  watermark_length: 16
+  watermark_seed: 42
+  train_watermark_mode: fixed
+  val_watermark_mode: fixed
+  max_train_images: 32
+  max_val_images: 32
+
+model:
+  base_channels: 64
+  cond_dim: 256
+  use_pretrained_unet: false
+  pretrained_path: null
+  use_watermark_time_emb: true
+  use_watermark_spatial_map: true
+  wm_map_channels: 4
+  wm_map_size: 16
+  wm_time_scale: 1.0
+  wm_map_scale: 1.0
+
+decoder:
+  type: residual_multiscale
+  base_channels: 32
+  hidden_dim: 512
+  dropout: 0.0
+  norm_groups: 8
+  use_multiscale: true
+
+diffusion:
+  timesteps: 1000
+  beta_schedule: linear
+  wm_t_min: 0
+  wm_t_max: 20
+  train_t_start: 50
+  sample_steps: 50
+
+train:
+  seed: 42
+  deterministic: true
+  batch_size: 16
+  num_workers: 4
+  lr: 0.0001
+  epochs: 300
+  device: cuda
+  use_amp: true
+
+  lambda_diff: 0.0
+  lambda_img: 0.05
+  lambda_wm: 30.0
+  lambda_delta: 0.0
+
+  use_loss_schedule: false
+  loss_schedule: []
+
+  save_interval: 10
+  sample_interval: 200
+  log_interval: 20
+  debug_interval: 100
+  reset_decoder: false
+
+noise_layer:
+  type: none
+
+output:
+  checkpoint_dir: ./checkpoints_stage1_overfit
+  sample_dir: ./outputs_stage1_overfit/samples
+  log_dir: ./outputs_stage1_overfit/logs

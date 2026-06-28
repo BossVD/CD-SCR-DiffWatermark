@@ -148,6 +148,87 @@ def load_config(config_path):
             print("[WARNING] PyYAML not installed; using default config.")
     return default_config()
 
+
+def _get_checkpoint_model_state(ckpt):
+    if 'diffusion_model' in ckpt:
+        return ckpt['diffusion_model']
+    if 'model' in ckpt:
+        return ckpt['model']
+    return ckpt
+
+
+def load_decoder_checkpoint(decoder, decoder_state, log_prefix):
+    try:
+        decoder.load_state_dict(decoder_state, strict=True)
+        print(f"{log_prefix} Loaded watermark decoder weights.")
+        return
+    except RuntimeError as exc:
+        print(f"{log_prefix} Decoder strict=True load failed: {exc}")
+
+    missing, unexpected, mismatched = load_watermark_decoder_state(
+        decoder, decoder_state
+    )
+    print(f"{log_prefix} Decoder weights are partially loaded with strict=False.")
+    print(f"{log_prefix} Missing keys: {missing}")
+    print(f"{log_prefix} Unexpected keys: {unexpected}")
+    print(f"{log_prefix} Mismatched keys: {mismatched}")
+
+
+def resume_training(checkpoint_path, model, decoder, optimizer, scaler,
+                    train_generator, device):
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Resume checkpoint not found: {checkpoint_path}")
+
+    print(f"[Resume] Resume training from: {checkpoint_path}")
+    ckpt = torch.load(checkpoint_path, map_location=device)
+    model.load_state_dict(_get_checkpoint_model_state(ckpt), strict=True)
+    print("[Resume] Loaded diffusion model.")
+
+    if 'decoder' in ckpt:
+        load_decoder_checkpoint(decoder, ckpt['decoder'], "[Resume]")
+    else:
+        print("[Resume] No decoder weights found in checkpoint.")
+
+    if 'optimizer' in ckpt:
+        optimizer.load_state_dict(ckpt['optimizer'])
+        print("[Resume] Loaded optimizer.")
+    else:
+        print("[Resume] No optimizer state found in checkpoint.")
+
+    if scaler is not None and 'scaler' in ckpt:
+        scaler.load_state_dict(ckpt['scaler'])
+        print("[Resume] Loaded AMP scaler.")
+
+    start_epoch = ckpt.get('epoch', 0) + 1
+    global_step = ckpt.get('global_step', 0)
+    restore_random_state(ckpt.get('random_state'), train_generator)
+    print(f"[Resume] start_epoch={start_epoch}, global_step={global_step}")
+    if 'best_bit_acc' in ckpt:
+        best_name = ckpt.get('best_metric_name', 'bit_acc_clean')
+        print(f"[Resume] Previous best {best_name}={ckpt['best_bit_acc']:.4f}")
+    return start_epoch, global_step
+
+
+def init_from_checkpoint(checkpoint_path, model, decoder, reset_decoder, device):
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Init checkpoint not found: {checkpoint_path}")
+
+    print(f"[Init] Initialize new training stage from: {checkpoint_path}")
+    ckpt = torch.load(checkpoint_path, map_location=device)
+    model.load_state_dict(_get_checkpoint_model_state(ckpt), strict=True)
+    print("[Init] Loaded diffusion model weights.")
+
+    if reset_decoder:
+        print("[Init] reset_decoder=true, skip loading old decoder weights.")
+    elif 'decoder' in ckpt:
+        load_decoder_checkpoint(decoder, ckpt['decoder'], "[Init]")
+    else:
+        print("[Init] No decoder weights found in checkpoint.")
+
+    print("[Init] Skip optimizer state.")
+    print("[Init] Reset start_epoch=1, global_step=0.")
+    return 1, 0
+
 def default_config():
     return {
         'data': {
@@ -430,58 +511,24 @@ def train(config):
     scaler = torch.amp.GradScaler('cuda') if amp_enabled else None
     print(f"[Train] AMP autocast: {'enabled' if amp_enabled else 'disabled'}")
 
-    # --- Resume from checkpoint (for Stage 2 continuation) ---
+    # --- Checkpoint loading ---
     resume_path = cfg.get('_resume_path', None)
+    init_from_path = cfg.get('_init_from_path', None)
     start_epoch = 1
-    if resume_path and os.path.exists(resume_path):
-        print(f"[Resume] Loading checkpoint from {resume_path}")
-        ckpt = torch.load(resume_path, map_location=device)
-        model.load_state_dict(ckpt['diffusion_model'])
-        reset_decoder = cfg['train'].get('reset_decoder', False)
-        if reset_decoder:
-            print("[Resume] reset_decoder=true, skip loading old decoder weights.")
-        elif 'decoder' in ckpt:
-            missing, unexpected, mismatched = load_watermark_decoder_state(
-                decoder, ckpt['decoder']
-            )
-            if missing or unexpected or mismatched:
-                print(
-                    "[Resume] Decoder structure changed, loaded compatible "
-                    "weights with strict=False."
-                )
-                print(f"[Resume] Missing decoder keys: {missing}")
-                print(f"[Resume] Unexpected decoder keys: {unexpected}")
-                print(f"[Resume] Mismatched decoder keys: {mismatched}")
-            else:
-                print("[Resume] Decoder weights loaded.")
-
-        if not reset_decoder and 'optimizer' in ckpt:
-            try:
-                optimizer.load_state_dict(ckpt['optimizer'])
-            except ValueError as exc:
-                print(
-                    "[Resume] Optimizer state is incompatible with the current "
-                    f"decoder; starting optimizer from scratch. Reason: {exc}"
-                )
-        elif reset_decoder:
-            print("[Resume] reset_decoder=true, start optimizer from scratch.")
-        if scaler is not None and 'scaler' in ckpt:
-            scaler.load_state_dict(ckpt['scaler'])
-        start_epoch = ckpt['epoch'] + 1
-        global_step = ckpt['global_step']
-        print(f"[Resume] Restored epoch={ckpt['epoch']}, global_step={global_step}")
-        if 'best_bit_acc' in ckpt:
-            best_name = ckpt.get('best_metric_name', 'bit_acc_clean')
-            print(
-                f"[Resume] Previous best {best_name}="
-                f"{ckpt['best_bit_acc']:.4f}"
-            )
-        restore_random_state(ckpt.get('random_state'), train_generator)
-    else:
-        if resume_path:
-            print(f"[WARNING] Resume checkpoint not found: {resume_path}")
-            print("[WARNING] Training from scratch.")
-        global_step = 0
+    global_step = 0
+    if resume_path:
+        start_epoch, global_step = resume_training(
+            resume_path, model, decoder, optimizer, scaler,
+            train_generator, device,
+        )
+    elif init_from_path:
+        start_epoch, global_step = init_from_checkpoint(
+            init_from_path,
+            model,
+            decoder,
+            cfg['train'].get('reset_decoder', False),
+            device,
+        )
 
     # --- Loss weights ---
     lambda_diff = cfg['train']['lambda_diff']
@@ -906,12 +953,23 @@ if __name__ == '__main__':
     parser.add_argument('--config', type=str, default=None,
                         help='Path to YAML config file')
     parser.add_argument('--resume', type=str, default=None,
-                        help='Path to checkpoint to resume training from (e.g. checkpoints/best.pt)')
+                        help='Path to checkpoint to continue the same training stage')
+    parser.add_argument('--init_from', type=str, default=None,
+                        help='Path to checkpoint used to initialize a new training stage')
     args = parser.parse_args()
+
+    if args.resume and args.init_from:
+        parser.error(
+            "[Error] --resume and --init_from cannot be used at the same time.\n"
+            "Use --resume for continuing the same training stage.\n"
+            "Use --init_from for initializing a new stage from a previous checkpoint."
+        )
 
     config = load_config(args.config)
     if args.resume:
         config['_resume_path'] = args.resume
+    if args.init_from:
+        config['_init_from_path'] = args.init_from
     train(config)
 
 

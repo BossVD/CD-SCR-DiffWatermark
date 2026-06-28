@@ -33,6 +33,32 @@ from models.watermark_decoder import (
 from NOISE_LAYER.build_noise_layer import build_noise_layer
 
 
+def load_yaml_config(config_path):
+    if not config_path:
+        return None
+    import yaml
+    with open(config_path, 'r', encoding='utf-8-sig') as handle:
+        return yaml.safe_load(handle)
+
+
+def build_sample_noise_layer(cfg, noise_type, device):
+    noise_type = str(noise_type).lower()
+    if noise_type == 'none':
+        return None
+    if noise_type not in {'pimog', 'oled', 'led', 'projector', 'mixed'}:
+        raise ValueError(f'Unsupported noise layer for sampling: {noise_type}')
+    sample_cfg = dict(cfg)
+    sample_cfg['noise_layer'] = dict(cfg.get('noise_layer', {}), type=noise_type)
+    if noise_type in {'pimog', 'oled', 'led', 'projector'}:
+        sample_cfg['noise_layer'][noise_type] = dict(
+            cfg.get('noise_layer', {}).get(noise_type, {}),
+            p=1.0,
+        )
+    layer = build_noise_layer(sample_cfg).to(device)
+    layer.eval()
+    return layer
+
+
 def embed_watermark_sample(diffusion, model, cover_img, wm_bits, t_start=300):
     """
     Image-to-image watermark embedding via partial DDPM reverse sampling.
@@ -85,6 +111,8 @@ def embed_watermark_sample(diffusion, model, cover_img, wm_bits, t_start=300):
 
 def main():
     parser = argparse.ArgumentParser(description='Embed watermark into cover image')
+    parser.add_argument('--config', type=str, default=None,
+                        help='Optional YAML config path; overrides checkpoint config')
     parser.add_argument('--checkpoint', type=str, required=True,
                         help='Path to checkpoint file (.pt)')
     parser.add_argument('--input', type=str, required=True,
@@ -101,6 +129,8 @@ def main():
                         help='Device to run on')
     parser.add_argument('--seed', type=int, default=None,
                         help='Random seed; defaults to the checkpoint training seed')
+    parser.add_argument('--noise_layer', type=str, default='none',
+                        help='Noise layer for degraded verification: none, pimog, oled, led, projector, mixed')
     parser.add_argument('--save_degraded', action='store_true',
                         help='Also save fixed degradation variants of the watermarked image')
     parser.add_argument('--degradation_types', type=str, default='pimog,oled,led,projector',
@@ -114,6 +144,9 @@ def main():
     print(f"[Sample] Loading checkpoint: {args.checkpoint}")
     checkpoint = torch.load(args.checkpoint, map_location='cpu')
     cfg = checkpoint.get('config', {})
+    config_override = load_yaml_config(args.config)
+    if config_override is not None:
+        cfg = config_override
 
     seed = args.seed if args.seed is not None else cfg.get('train', {}).get('seed', 42)
     random.seed(seed)
@@ -218,11 +251,35 @@ def main():
 
     # --- Verify ---
     watermarked_01 = (watermarked + 1.0) / 2.0
-    logits = decoder(watermarked)
-    pred_bits = (torch.sigmoid(logits) > 0.5).float()
-    bit_acc = (pred_bits == wm_bits).float().mean().item()
-    print(f"[Sample] Recovered bit accuracy: {bit_acc:.4f}")
-    print(f"[Sample] Recovered bits: {''.join(str(int(b)) for b in pred_bits[0].tolist())}")
+    logits_clean = decoder(watermarked)
+    pred_bits_clean = (torch.sigmoid(logits_clean) > 0.5).float()
+    bit_acc_clean = (pred_bits_clean == wm_bits).float().mean().item()
+
+    requested_noise_type = str(args.noise_layer).lower()
+    selected_noise_label = requested_noise_type
+    noise_layer = build_sample_noise_layer(cfg, requested_noise_type, device)
+    if noise_layer is not None:
+        degraded_01 = noise_layer(watermarked_01).float().clamp(0.0, 1.0)
+        if requested_noise_type == 'mixed' and hasattr(noise_layer, 'get_last_name'):
+            selected_noise_label = f"mixed:{noise_layer.get_last_name()}"
+        degraded = degraded_01.mul(2.0).sub(1.0)
+    else:
+        degraded_01 = watermarked_01
+        degraded = watermarked
+
+    logits_degraded = decoder(degraded)
+    pred_bits_degraded = (torch.sigmoid(logits_degraded) > 0.5).float()
+    bit_acc_degraded = (pred_bits_degraded == wm_bits).float().mean().item()
+
+    print(f"[Sample] bit_acc_clean={bit_acc_clean:.4f}")
+    print(
+        f"[Sample] bit_acc_degraded={bit_acc_degraded:.4f} "
+        f"noise_layer={requested_noise_type}"
+    )
+    if selected_noise_label != requested_noise_type:
+        print(f"[Sample] mixed selected layer: {selected_noise_label}")
+    print(f"[Sample] Recovered bits clean: {''.join(str(int(b)) for b in pred_bits_clean[0].tolist())}")
+    print(f"[Sample] Recovered bits degraded: {''.join(str(int(b)) for b in pred_bits_degraded[0].tolist())}")
 
     # --- Save ---
     os.makedirs(os.path.dirname(args.output) if os.path.dirname(args.output) else '.', exist_ok=True)
@@ -242,6 +299,19 @@ def main():
             'degraded',
         )
         os.makedirs(degraded_dir, exist_ok=True)
+        file_noise_label = selected_noise_label.replace(':', '_')
+        degraded_path = os.path.join(
+            degraded_dir, f'{base_name}_degraded_{file_noise_label}.png'
+        )
+        save_image(degraded_01[0], degraded_path)
+
+        residual_01 = (watermarked_01 - cover_01).abs().clamp(0.0, 1.0)
+        grid = torch.cat([cover_01, watermarked_01, degraded_01, residual_01], dim=0)
+        grid_path = os.path.join(degraded_dir, f'{base_name}_grid.png')
+        save_image(grid, grid_path, nrow=4)
+        print(f"[Sample] Degraded image saved to: {degraded_path}")
+        print(f"[Sample] Grid saved to: {grid_path}")
+
         degradation_types = [
             item.strip().lower()
             for item in args.degradation_types.split(',')

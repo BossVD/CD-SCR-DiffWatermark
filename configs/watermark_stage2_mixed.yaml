@@ -42,8 +42,8 @@ train:
   use_amp: true
 
   lambda_diff: 1.0
-  lambda_img: 1.0
-  lambda_wm: 8.0
+  lambda_img: 1.5
+  lambda_wm: 5.0
 
   save_interval: 1
   sample_interval: 5000

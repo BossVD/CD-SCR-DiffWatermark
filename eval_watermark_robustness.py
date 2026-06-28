@@ -42,6 +42,36 @@ def compute_psnr(pred, target, max_val=1.0):
     return (20 * math.log10(max_val) - 10 * math.log10(mse.item()))
 
 
+def load_yaml_config(config_path):
+    if not config_path:
+        return None
+    import yaml
+    with open(config_path, 'r', encoding='utf-8-sig') as handle:
+        return yaml.safe_load(handle)
+
+
+def parse_noise_layers(value):
+    layers = [item.strip().lower() for item in value.split(',') if item.strip()]
+    valid = {'clean', 'pimog', 'oled', 'led', 'projector', 'mixed'}
+    invalid = [layer for layer in layers if layer not in valid]
+    if invalid:
+        raise ValueError(f"Unsupported noise layer(s): {invalid}")
+    return layers
+
+
+def build_eval_noise_layer(cfg, noise_type, device):
+    eval_cfg = dict(cfg)
+    eval_cfg['noise_layer'] = dict(cfg.get('noise_layer', {}), type=noise_type)
+    if noise_type in {'pimog', 'oled', 'led', 'projector'}:
+        eval_cfg['noise_layer'][noise_type] = dict(
+            cfg.get('noise_layer', {}).get(noise_type, {}),
+            p=1.0,
+        )
+    simulator = build_noise_layer(eval_cfg).to(device)
+    simulator.eval()
+    return simulator
+
+
 def embed_watermark_eval(diffusion, model, cover_img, wm_bits, t_start=300):
     """Same as embed_watermark in train script, but for evaluation."""
     device = cover_img.device
@@ -82,10 +112,15 @@ def main():
     parser = argparse.ArgumentParser(description='Evaluate watermark robustness')
     parser.add_argument('--checkpoint', type=str, required=True,
                         help='Path to checkpoint file (.pt)')
-    parser.add_argument('--data_dir', type=str, required=True,
-                        help='Path to validation data directory')
+    parser.add_argument('--config', type=str, default=None,
+                        help='Optional YAML config path; overrides checkpoint config')
+    parser.add_argument('--data_dir', type=str, default=None,
+                        help='Path to validation data directory; defaults to config data.val_dir')
     parser.add_argument('--output', type=str, default='./outputs/eval_results.csv',
                         help='Output CSV path')
+    parser.add_argument('--noise_layers', type=str,
+                        default='clean,pimog,oled,led,projector,mixed',
+                        help='Comma-separated layers to evaluate')
     parser.add_argument('--t_start', type=int, default=300,
                         help='Timestep to start reverse from')
     parser.add_argument('--device', type=str, default='cuda',
@@ -103,6 +138,9 @@ def main():
     print(f"[Eval] Loading checkpoint: {args.checkpoint}")
     checkpoint = torch.load(args.checkpoint, map_location='cpu')
     cfg = checkpoint.get('config', {})
+    config_override = load_yaml_config(args.config)
+    if config_override is not None:
+        cfg = config_override
 
     seed = args.seed if args.seed is not None else cfg.get('train', {}).get('seed', 42)
     random.seed(seed)
@@ -161,8 +199,11 @@ def main():
     decoder.eval()
 
     # --- Dataset ---
+    data_dir = args.data_dir or cfg.get('data', {}).get('val_dir')
+    if not data_dir:
+        raise ValueError("Validation data directory is required via --data_dir or config data.val_dir")
     dataset = WatermarkImageDataset(
-        data_dir=args.data_dir,
+        data_dir=data_dir,
         image_size=image_size,
         watermark_length=watermark_length,
         watermark_seed=cfg.get('data', {}).get('watermark_seed', 42),
@@ -179,13 +220,14 @@ def main():
     )
     print(f"[Eval] Dataset size: {len(dataset)}")
 
-    simulators = {'clean': None}
-    for noise_type in ('pimog', 'projector', 'mixed'):
-        eval_cfg = dict(cfg)
-        eval_cfg['noise_layer'] = dict(cfg.get('noise_layer', {}), type=noise_type)
-        simulator = build_noise_layer(eval_cfg).to(device)
-        simulator.eval()
-        simulators[noise_type] = simulator
+    requested_layers = parse_noise_layers(args.noise_layers)
+    simulators = {}
+    for noise_type in requested_layers:
+        if noise_type == 'clean':
+            simulators[noise_type] = None
+        else:
+            simulators[noise_type] = build_eval_noise_layer(cfg, noise_type, device)
+    print(f"[Eval] Noise layers: {', '.join(requested_layers)}")
 
     # --- Evaluate ---
     results = defaultdict(list)
@@ -212,29 +254,27 @@ def main():
             watermarked_01 = (watermarked + 1.0) / 2.0
             cover_01 = (cover_img + 1.0) / 2.0
 
-            # PSNR
-            psnr_val = compute_psnr(watermarked_01, cover_01, max_val=1.0)
-            l1_val = F.l1_loss(watermarked, cover_img).item()
-
             # Test each degradation level
             for level_name, simulator in simulators.items():
                 if simulator is not None:
                     degraded_01 = simulator(watermarked_01).float()
                     degraded = degraded_01.mul(2.0).sub(1.0)
                 else:
+                    degraded_01 = watermarked_01
                     degraded = watermarked
 
                 logits = decoder(degraded)
                 pred_bits = (torch.sigmoid(logits) > 0.5).float()
+                psnr_val = compute_psnr(degraded_01, cover_01, max_val=1.0)
+                l1_val = F.l1_loss(degraded, cover_img).item()
 
                 # Per-sample accuracy
                 for i in range(cover_img.size(0)):
                     acc = (pred_bits[i] == wm_bits[i]).float().mean().item()
                     results[f'bit_acc_{level_name}'].append(acc)
-
-            # Keep metric arrays aligned with per-image bit-accuracy arrays.
-            results['psnr'].extend([psnr_val] * cover_img.size(0))
-            results['l1'].extend([l1_val] * cover_img.size(0))
+                    results[f'ber_{level_name}'].append(1.0 - acc)
+                    results[f'psnr_{level_name}'].append(psnr_val)
+                    results[f'l1_{level_name}'].append(l1_val)
 
             # Save some samples
             if sample_count < max_samples:
@@ -263,11 +303,22 @@ def main():
     print("=" * 60)
 
     summary = {}
-    for key, values in results.items():
-        if values:
-            avg = sum(values) / len(values)
-            summary[key] = avg
-            print(f"  {key:25s}: {avg:.4f}")
+    for level_name in requested_layers:
+        bit_key = f'bit_acc_{level_name}'
+        ber_key = f'ber_{level_name}'
+        psnr_key = f'psnr_{level_name}'
+        if not results[bit_key]:
+            continue
+        bit_acc = sum(results[bit_key]) / len(results[bit_key])
+        ber = sum(results[ber_key]) / len(results[ber_key])
+        psnr = sum(results[psnr_key]) / len(results[psnr_key])
+        summary[bit_key] = bit_acc
+        summary[ber_key] = ber
+        summary[psnr_key] = psnr
+        print(
+            f"[Eval] {level_name:9s}: "
+            f"bit_acc={bit_acc:.4f}, BER={ber:.4f}, PSNR={psnr:.2f}"
+        )
 
     # --- Save CSV ---
     with open(args.output, 'w', newline='') as f:

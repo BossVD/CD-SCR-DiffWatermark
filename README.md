@@ -120,8 +120,12 @@ noise_layer:
 ```bash
 python train_watermark_diffusion.py \
   --config configs/watermark_stage2_mixed.yaml \
-  --resume checkpoints_stage1/best.pt
+  --init_from checkpoints_stage1/best.pt
 ```
+
+`--init_from` 用于从上一阶段 checkpoint 初始化一个新训练阶段，例如 Stage1 到 Stage2；它只加载 diffusion model 和 decoder 权重，不继承 epoch、global_step 或 optimizer 状态。
+
+`--resume` 用于同一训练阶段中断后的继续训练；它会恢复模型、decoder、optimizer、epoch、global_step 和随机状态。
 
 ### Stage 2 配置要点
 
@@ -133,7 +137,8 @@ noise_layer:
 
 train:
   lr: 0.00005           # 微调用更低学习率
-  lambda_wm: 8.0         # 噪声层下提高水印权重
+  lambda_img: 1.5        # 增强图像保真约束
+  lambda_wm: 5.0         # Stage 2 初始值更稳，后续可按 bit_acc 调高
   epochs: 50
   reset_decoder: false   # 旧 decoder checkpoint 不兼容时可手动改为 true
 
@@ -159,6 +164,14 @@ python train_watermark_diffusion.py \
   --resume checkpoints_stage2_mixed/latest.pt
 ```
 
+### Stage 2 从 Stage 1 初始化
+
+```bash
+python train_watermark_diffusion.py \
+  --config configs/watermark_stage2_mixed.yaml \
+  --init_from checkpoints_stage1/best.pt
+```
+
 ---
 
 ## 采样（生成带水印图）
@@ -181,16 +194,18 @@ python sample_embed_watermark.py \
 
 # 同时保存固定退化版本，便于区分 mixed 训练后的不同屏摄退化
 python sample_embed_watermark.py \
+  --config configs/watermark_stage2_mixed.yaml \
   --checkpoint checkpoints_stage2_mixed/best.pt \
   --input ./test_images/cover.png \
   --output ./outputs_stage2_mixed/watermarked.png \
   --t_start 200 \
+  --noise_layer mixed \
   --save_degraded \
   --degradation_types pimog,oled,led,projector
 ```
 
 水印位数不足 64 位会自动补 0，超出会被截断。
-固定退化版本会保存到输出目录下的 `degraded/` 子目录，文件名包含退化类型。
+采样会输出 `bit_acc_clean` 和 `bit_acc_degraded`。传入 `--save_degraded` 时，会把退化图、cover/watermarked/degraded/residual grid，以及固定退化版本保存到输出目录下的 `degraded/` 子目录。
 
 ---
 
@@ -211,9 +226,12 @@ D:\Anaconda_envs\envs\wadiff\python.exe tools\test_noise_layer.py `
 ```bash
 python eval_watermark_robustness.py \
   --checkpoint checkpoints_stage2_mixed/best.pt \
-  --data_dir ./data/val \
+  --config configs/watermark_stage2_mixed.yaml \
+  --noise_layers clean,pimog,oled,led,projector,mixed \
   --output ./outputs_stage2_mixed/eval_results.csv
 ```
+
+评估脚本默认评估 `clean,pimog,oled,led,projector,mixed`，并输出每种退化下的 `bit_acc`、`BER` 和 `PSNR`。如果不传 `--data_dir`，会使用配置文件中的 `data.val_dir`。
 
 ---
 

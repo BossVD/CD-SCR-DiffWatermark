@@ -1,7 +1,7 @@
 ﻿data:
   train_dir: /root/autodl-tmp/datasets/train2017
   val_dir: /root/autodl-tmp/datasets/val2017
-  image_size: 1024
+  image_size: 128
   watermark_length: 64
   watermark_seed: 42
   train_watermark_mode: per_epoch
@@ -28,13 +28,13 @@ train:
   deterministic: true
   batch_size: 32
   num_workers: 8
-  lr: 0.00005
+  lr: 0.0001
   epochs: 50
   device: cuda
   use_amp: true
 
-  lambda_diff: 0.5
-  lambda_img: 0.5
+  lambda_diff: 1.0
+  lambda_img: 1.0
   lambda_wm: 8.0
 
   save_interval: 1
@@ -118,7 +118,7 @@ noise_layer:
     highlight_clip: true
 
   projector:
-    p: 0.8
+    p: 1.0
     gamma_range: [1.1, 1.8]
     brightness_gain: [1.00, 1.15]
     falloff_strength: [0.06, 0.20]
@@ -153,7 +153,7 @@ noise_layer:
   # Optional stronger preset for later robustness fine-tuning. It is not used
   # by build_noise_layer unless copied into noise_layer.projector.
   projector_strong:
-    p: 0.9
+    p: 1.0
     gamma_range: [1.4, 2.2]
     brightness_gain: [1.00, 1.12]
     falloff_strength: [0.10, 0.32]

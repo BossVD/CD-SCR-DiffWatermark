@@ -89,6 +89,8 @@ train:
   lr: 0.0001
   lambda_wm: 5.0
   epochs: 50
+  log_interval: 100
+  debug_interval: 500
   use_loss_schedule: true
   loss_schedule:
     - until_step: 2000

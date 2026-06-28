@@ -69,6 +69,7 @@ train:
   save_interval: 1
   sample_interval: 5000
   log_interval: 100
+  debug_interval: 500
   reset_decoder: false
 
 # Stage 1 trains clean embedding/extraction only.

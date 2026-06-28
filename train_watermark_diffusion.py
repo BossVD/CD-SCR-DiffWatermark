@@ -647,6 +647,7 @@ def train(config):
     save_interval = cfg['train']['save_interval']
     sample_interval = cfg['train']['sample_interval']
     log_interval = cfg['train']['log_interval']
+    debug_interval = cfg['train'].get('debug_interval', log_interval * 5)
     # --- CSV loggers ---
     train_log_path = os.path.join(log_dir, 'train_log.csv')
     val_log_path = os.path.join(log_dir, 'val_log.csv')
@@ -670,7 +671,10 @@ def train(config):
         val_writer.writeheader()
 
     # --- Training loop ---
-    print(f"[Train] Starting training: {epochs} epochs, log_interval={log_interval}")
+    print(
+        f"[Train] Starting training: {epochs} epochs, "
+        f"log_interval={log_interval}, debug_interval={debug_interval}"
+    )
     print(
         f"[Train] initial lambda_diff={initial_lambda_diff}, "
         f"lambda_img={initial_lambda_img}, lambda_wm={initial_lambda_wm}"
@@ -820,34 +824,6 @@ def train(config):
             # 6. Logging
             # ========================================================
             if global_step % log_interval == 0:
-                with torch.no_grad():
-                    debug_count = min(2, B)
-                    debug_x_t = x_t_wm[:debug_count]
-                    debug_t = t_wm[:debug_count]
-                    debug_t_scaled = t_wm_scaled[:debug_count]
-                    debug_cover = cover_img[:debug_count]
-                    debug_wm_a = wm_bits[:debug_count]
-                    debug_wm_b = 1.0 - debug_wm_a
-                    pred_noise_a = model(
-                        x_t=debug_x_t,
-                        t=debug_t_scaled,
-                        cover_img=debug_cover,
-                        wm_bits=debug_wm_a,
-                    )
-                    pred_noise_b = model(
-                        x_t=debug_x_t,
-                        t=debug_t_scaled,
-                        cover_img=debug_cover,
-                        wm_bits=debug_wm_b,
-                    )
-                    pred_x0_a = predict_start_from_noise(
-                        diffusion, debug_x_t, debug_t, pred_noise_a
-                    )
-                    pred_x0_b = predict_start_from_noise(
-                        diffusion, debug_x_t, debug_t, pred_noise_b
-                    )
-                    pred_x0_delta = (pred_x0_a - pred_x0_b).abs().mean().item()
-
                 log_data = {
                     'epoch': epoch,
                     'global_step': global_step,
@@ -871,18 +847,44 @@ def train(config):
                     f"bit_acc={bit_acc:.3f} PSNR={psnr_val:.1f} "
                     f"noise_layer={noise_type}"
                 )
-                print(
-                    f"[Debug] logits_mean={logits_mean:.4f} "
-                    f"logits_std={logits_std:.4f} "
-                    f"sigmoid_mean={sigmoid_mean:.4f} "
-                    f"pred_x0_delta_same_cover_diff_wm={pred_x0_delta:.6f}"
-                )
-                print(
-                    f"[Debug] model_gn={model_gn:.4f} "
-                    f"decoder_gn={decoder_gn:.4f} "
-                    f"wm_mlp_gn={wm_mlp_gn:.4f} "
-                    f"wm_map_mlp_gn={wm_map_mlp_gn:.4f}"
-                )
+
+                if debug_interval > 0 and global_step % debug_interval == 0:
+                    with torch.no_grad():
+                        debug_count = min(2, B)
+                        debug_x_t = x_t_wm[:debug_count]
+                        debug_t = t_wm[:debug_count]
+                        debug_t_scaled = t_wm_scaled[:debug_count]
+                        debug_cover = cover_img[:debug_count]
+                        debug_wm_a = wm_bits[:debug_count]
+                        debug_wm_b = 1.0 - debug_wm_a
+                        pred_noise_a = model(
+                            x_t=debug_x_t,
+                            t=debug_t_scaled,
+                            cover_img=debug_cover,
+                            wm_bits=debug_wm_a,
+                        )
+                        pred_noise_b = model(
+                            x_t=debug_x_t,
+                            t=debug_t_scaled,
+                            cover_img=debug_cover,
+                            wm_bits=debug_wm_b,
+                        )
+                        pred_x0_a = predict_start_from_noise(
+                            diffusion, debug_x_t, debug_t, pred_noise_a
+                        )
+                        pred_x0_b = predict_start_from_noise(
+                            diffusion, debug_x_t, debug_t, pred_noise_b
+                        )
+                        pred_x0_delta = (pred_x0_a - pred_x0_b).abs().mean().item()
+
+                    print(
+                        f"[Debug S{global_step:06d}] "
+                        f"logits_std={logits_std:.4f} "
+                        f"sigmoid_mean={sigmoid_mean:.4f} "
+                        f"delta={pred_x0_delta:.6f} "
+                        f"gn(model={model_gn:.3f},dec={decoder_gn:.3f},"
+                        f"wm={wm_mlp_gn:.3f},map={wm_map_mlp_gn:.3f})"
+                    )
 
             # ========================================================
             # 7. Periodic sampling

@@ -599,6 +599,8 @@ def train(config):
                 pred_x0_01 = (pred_x0 + 1.0) / 2.0
 
                 attacked_01 = noise_layer(pred_x0_01).float()
+                if noise_type == 'mixed':
+                    active_noise_type = f"mixed:{noise_layer.get_last_name()}"
                 decoder_input = attacked_01.mul(2.0).sub(1.0)
 
                 pred_logits = decoder(decoder_input)
@@ -687,6 +689,9 @@ def train(config):
                     s_wm_01 = (s_watermarked + 1.0) / 2.0
 
                     s_degraded_01 = noise_layer(s_wm_01).float()
+                    sample_noise_type = (
+                        noise_layer.get_last_name() if noise_type == 'mixed' else noise_type
+                    )
                     s_decoder_input = s_degraded_01.mul(2.0).sub(1.0)
                     s_logits = decoder(s_decoder_input)
                     s_bits = (torch.sigmoid(s_logits) > 0.5).float()
@@ -694,9 +699,15 @@ def train(config):
 
                     # Save comparison grid
                     comparison = torch.cat([s_cover_01, s_wm_01, s_degraded_01], dim=0)
-                    save_path = os.path.join(sample_dir, f'step_{global_step:06d}_acc_{s_acc:.3f}.png')
+                    save_path = os.path.join(
+                        sample_dir,
+                        f'step_{global_step:06d}_{sample_noise_type}_acc_{s_acc:.3f}.png',
+                    )
                     save_image(comparison, save_path, nrow=4)
-                    print(f"[Sample] Saved {save_path} (bit_acc={s_acc:.3f})")
+                    print(
+                        f"[Sample] Saved {save_path} "
+                        f"(noise={sample_noise_type}, bit_acc={s_acc:.3f})"
+                    )
 
                     # Also save individual images
                     for i in range(min(4, s_cover.size(0))):
@@ -705,7 +716,8 @@ def train(config):
                         save_image(s_wm_01[i], os.path.join(
                             sample_dir, f'step_{global_step:06d}_watermarked_{i}.png'))
                         save_image(s_degraded_01[i], os.path.join(
-                            sample_dir, f'step_{global_step:06d}_degraded_{i}.png'))
+                            sample_dir,
+                            f'step_{global_step:06d}_degraded_{sample_noise_type}_{i}.png'))
 
                 model.train()
 

@@ -178,9 +178,19 @@ python sample_embed_watermark.py \
   --watermark "1010101011001010" \
   --output ./outputs_stage2_mixed/watermarked.png \
   --t_start 200
+
+# 同时保存固定退化版本，便于区分 mixed 训练后的不同屏摄退化
+python sample_embed_watermark.py \
+  --checkpoint checkpoints_stage2_mixed/best.pt \
+  --input ./test_images/cover.png \
+  --output ./outputs_stage2_mixed/watermarked.png \
+  --t_start 200 \
+  --save_degraded \
+  --degradation_types pimog,oled,led,projector
 ```
 
 水印位数不足 64 位会自动补 0，超出会被截断。
+固定退化版本会保存到输出目录下的 `degraded/` 子目录，文件名包含退化类型。
 
 ---
 

@@ -30,6 +30,7 @@ from models.watermark_decoder import (
     build_watermark_decoder,
     load_watermark_decoder_state,
 )
+from NOISE_LAYER.build_noise_layer import build_noise_layer
 
 
 def embed_watermark_sample(diffusion, model, cover_img, wm_bits, t_start=300):
@@ -100,6 +101,10 @@ def main():
                         help='Device to run on')
     parser.add_argument('--seed', type=int, default=None,
                         help='Random seed; defaults to the checkpoint training seed')
+    parser.add_argument('--save_degraded', action='store_true',
+                        help='Also save fixed degradation variants of the watermarked image')
+    parser.add_argument('--degradation_types', type=str, default='pimog,oled,led,projector',
+                        help='Comma-separated degradation types used with --save_degraded')
     args = parser.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
@@ -230,6 +235,33 @@ def main():
     comparison = torch.cat([cover_01, watermarked_01], dim=0)
     base_name = os.path.splitext(os.path.basename(args.output))[0]
     save_image(comparison, os.path.join(comparison_dir, f'{base_name}_comparison.png'), nrow=1)
+
+    if args.save_degraded:
+        degraded_dir = os.path.join(
+            os.path.dirname(args.output) if os.path.dirname(args.output) else '.',
+            'degraded',
+        )
+        os.makedirs(degraded_dir, exist_ok=True)
+        degradation_types = [
+            item.strip().lower()
+            for item in args.degradation_types.split(',')
+            if item.strip()
+        ]
+        for noise_type in degradation_types:
+            if noise_type not in {'pimog', 'oled', 'led', 'projector'}:
+                raise ValueError(f'Unsupported degradation type for sampling: {noise_type}')
+            sample_cfg = dict(cfg)
+            sample_cfg['noise_layer'] = dict(cfg.get('noise_layer', {}), type=noise_type)
+            sample_cfg['noise_layer'][noise_type] = dict(
+                cfg.get('noise_layer', {}).get(noise_type, {}),
+                p=1.0,
+            )
+            layer = build_noise_layer(sample_cfg).to(device)
+            layer.eval()
+            degraded_01 = layer(watermarked_01).float().clamp(0.0, 1.0)
+            degraded_path = os.path.join(degraded_dir, f'{base_name}_{noise_type}.png')
+            save_image(degraded_01[0], degraded_path)
+            print(f"[Sample] {noise_type} degraded image saved to: {degraded_path}")
 
     print(f"[Sample] Watermarked image saved to: {args.output}")
     print(f"[Sample] Comparison saved to: {comparison_dir}")

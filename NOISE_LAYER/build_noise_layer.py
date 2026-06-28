@@ -12,11 +12,18 @@ from .LED_Layer import LEDNoiseLayer
 class MixedNoiseLayer(nn.Module):
     """Select one degradation layer for the whole batch on each forward call."""
 
-    def __init__(self, layers, probs=None):
+    def __init__(self, layers, probs=None, names=None):
         super().__init__()
         if not layers:
             raise ValueError("layers must not be empty")
         self.layers = nn.ModuleList(layers)
+        if names is None:
+            names = [layer.__class__.__name__ for layer in layers]
+        if len(names) != len(layers):
+            raise ValueError("names must match layers")
+        self.names = [str(name).lower() for name in names]
+        self.last_index = None
+        self.last_name = None
         if probs is None:
             probs = [1.0 / len(layers)] * len(layers)
         if len(probs) != len(layers) or any(float(p) < 0 for p in probs):
@@ -28,7 +35,12 @@ class MixedNoiseLayer(nn.Module):
 
     def forward(self, x):
         index = torch.multinomial(self.probs, 1).item()
+        self.last_index = index
+        self.last_name = self.names[index]
         return self.layers[index](x)
+
+    def get_last_name(self):
+        return self.last_name
 
 
 def get_noise_layer_type(config):
@@ -72,6 +84,7 @@ def build_noise_layer(config):
         return MixedNoiseLayer(
             layers=[_build_single_noise_layer(candidate, noise_cfg) for candidate in candidates],
             probs=probs,
+            names=candidates,
         )
     raise ValueError(
         f"Unsupported noise layer type: {noise_type}. "

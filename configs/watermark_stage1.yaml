@@ -2,10 +2,10 @@ data:
   train_dir: /root/autodl-tmp/datasets/train2017
   val_dir: /root/autodl-tmp/datasets/val2017
   image_size: 128
-  watermark_length: 32
+  watermark_length: 16
   watermark_seed: 42
-  train_watermark_mode: fixed
-  val_watermark_mode: fixed
+  train_watermark_mode: random
+  val_watermark_mode: deterministic_random
   max_train_images: 10000
   max_val_images: 1000
 
@@ -33,7 +33,7 @@ diffusion:
   timesteps: 1000
   beta_schedule: linear
   wm_t_min: 0
-  wm_t_max: 50
+  wm_t_max: 20
   train_t_start: 200
   sample_steps: 100
 
@@ -46,22 +46,15 @@ train:
   epochs: 50
   device: cuda
   use_amp: true
+  stage: warmup
 
-  lambda_diff: 1.0
-  lambda_img: 1.0
-  lambda_wm: 5.0
-  lambda_delta: 1.0
+  lambda_diff: 0.0
+  lambda_img: 0.1
+  lambda_wm: 20.0
+  lambda_delta: 0.0
 
-  use_loss_schedule: true
-  loss_schedule:
-    - until_step: 8000
-      lambda_diff: 0.0
-      lambda_img: 0.5
-      lambda_wm: 15.0
-    - until_step: -1
-      lambda_diff: 0.2
-      lambda_img: 1.0
-      lambda_wm: 10.0
+  use_loss_schedule: false
+  loss_schedule: []
 
   save_interval: 1
   sample_interval: 5000

@@ -59,20 +59,70 @@ def compute_psnr(pred, target, max_val=1.0):
 
 def get_loss_weights(cfg, global_step):
     train_cfg = cfg.get('train', {})
+    stage = str(train_cfg.get('stage', '')).lower()
+    if stage == 'warmup':
+        return {
+            'lambda_diff': 0.0,
+            'lambda_img': 0.1,
+            'lambda_wm': 20.0,
+            'lambda_delta': 0.0,
+        }
+    if stage == 'balance':
+        if global_step < 3000:
+            return {
+                'lambda_diff': 0.0,
+                'lambda_img': 0.1,
+                'lambda_wm': 20.0,
+                'lambda_delta': 0.0,
+            }
+        if global_step < 8000:
+            return {
+                'lambda_diff': 0.0,
+                'lambda_img': 0.5,
+                'lambda_wm': 12.0,
+                'lambda_delta': 0.0,
+            }
+        return {
+            'lambda_diff': 0.1,
+            'lambda_img': 1.0,
+            'lambda_wm': 8.0,
+            'lambda_delta': 0.0,
+        }
+    if stage == 'full':
+        return {
+            'lambda_diff': 0.3,
+            'lambda_img': 1.5,
+            'lambda_wm': 6.0,
+            'lambda_delta': 0.01,
+        }
+
     if train_cfg.get('use_loss_schedule', False):
         for item in train_cfg.get('loss_schedule', []):
             until_step = int(item.get('until_step', -1))
             if until_step < 0 or global_step < until_step:
-                return (
-                    float(item.get('lambda_diff', train_cfg['lambda_diff'])),
-                    float(item.get('lambda_img', train_cfg['lambda_img'])),
-                    float(item.get('lambda_wm', train_cfg['lambda_wm'])),
-                )
-    return (
-        float(train_cfg['lambda_diff']),
-        float(train_cfg['lambda_img']),
-        float(train_cfg['lambda_wm']),
-    )
+                return {
+                    'lambda_diff': float(item.get('lambda_diff', train_cfg['lambda_diff'])),
+                    'lambda_img': float(item.get('lambda_img', train_cfg['lambda_img'])),
+                    'lambda_wm': float(item.get('lambda_wm', train_cfg['lambda_wm'])),
+                    'lambda_delta': float(item.get('lambda_delta', train_cfg.get('lambda_delta', 0.0))),
+                }
+    return {
+        'lambda_diff': float(train_cfg['lambda_diff']),
+        'lambda_img': float(train_cfg['lambda_img']),
+        'lambda_wm': float(train_cfg['lambda_wm']),
+        'lambda_delta': float(train_cfg.get('lambda_delta', 0.0)),
+    }
+
+
+def generate_train_watermark(batch_size, length, device):
+    return torch.randint(0, 2, (batch_size, length), device=device).float()
+
+
+def generate_val_watermark(batch_size, length, seed, device, offset=0):
+    generator = torch.Generator(device='cpu')
+    generator.manual_seed(int(seed) + int(offset))
+    bits = torch.randint(0, 2, (batch_size, length), generator=generator).float()
+    return bits.to(device)
 
 
 def grad_norm(module):
@@ -369,6 +419,7 @@ def default_config():
             'epochs': 10,
             'device': 'cuda',
             'use_amp': True,
+            'stage': 'warmup',
             'lambda_diff': 1.0,
             'lambda_img': 1.0,
             'lambda_wm': 5.0,
@@ -636,12 +687,11 @@ def train(config):
         )
 
     # --- Loss weights ---
-    initial_lambda_diff, initial_lambda_img, initial_lambda_wm = get_loss_weights(cfg, 0)
+    initial_loss_weights = get_loss_weights(cfg, 0)
 
     # --- Timestep config ---
     wm_t_min = cfg['diffusion']['wm_t_min']
     wm_t_max = cfg['diffusion']['wm_t_max']
-    lambda_delta = float(cfg['train'].get('lambda_delta', 0.0))
     train_t_start = cfg['diffusion']['train_t_start']
 
     # --- Training state ---
@@ -658,7 +708,8 @@ def train(config):
     train_csv = open(train_log_path, csv_mode, newline='')
     train_writer = csv.DictWriter(train_csv, fieldnames=[
         'epoch', 'global_step', 'loss_total', 'loss_diff', 'loss_img', 'loss_wm',
-        'loss_delta', 'bit_acc', 'psnr', 'lr', 'noise_layer_type',
+        'loss_delta', 'bit_acc', 'psnr', 'logits_std', 'sigmoid_mean',
+        'bit_flip_image_delta', 'bit_flip_logit_delta', 'lr', 'noise_layer_type',
     ])
     if not os.path.exists(train_log_path) or os.path.getsize(train_log_path) == 0:
         train_writer.writeheader()
@@ -678,10 +729,12 @@ def train(config):
         f"log_interval={log_interval}, debug_interval={debug_interval}"
     )
     print(
-        f"[Train] initial lambda_diff={initial_lambda_diff}, "
-        f"lambda_img={initial_lambda_img}, lambda_wm={initial_lambda_wm}"
+        f"[Train] stage={cfg['train'].get('stage', 'legacy')} "
+        f"initial lambda_diff={initial_loss_weights['lambda_diff']}, "
+        f"lambda_img={initial_loss_weights['lambda_img']}, "
+        f"lambda_wm={initial_loss_weights['lambda_wm']}, "
+        f"lambda_delta={initial_loss_weights['lambda_delta']}"
     )
-    print(f"[Train] lambda_delta={lambda_delta}")
     if cfg['train'].get('use_loss_schedule', False):
         print(f"[Train] loss schedule enabled: {cfg['train'].get('loss_schedule', [])}")
     print(f"[Train] wm_t range: [{wm_t_min}, {wm_t_max}), noise_layer={noise_type}")
@@ -694,10 +747,14 @@ def train(config):
 
         for batch in train_loader:
             cover_img = batch['image'].to(device)    # [B, 3, H, W], [-1, 1]
-            wm_bits = batch['wm_bits'].to(device)    # [B, wm_len], 0/1 float
             B = cover_img.size(0)
+            wm_bits = generate_train_watermark(B, watermark_length, device)
             optimizer.zero_grad(set_to_none=True)
-            lambda_diff, lambda_img, lambda_wm = get_loss_weights(cfg, global_step)
+            loss_weights = get_loss_weights(cfg, global_step)
+            lambda_diff = loss_weights['lambda_diff']
+            lambda_img = loss_weights['lambda_img']
+            lambda_wm = loss_weights['lambda_wm']
+            lambda_delta = loss_weights['lambda_delta']
 
             # ========================================================
             # Official PIMoG is either fully enabled or disabled.
@@ -843,22 +900,13 @@ def train(config):
                     'loss_delta': loss_delta.item(),
                     'bit_acc': bit_acc,
                     'psnr': psnr_val,
+                    'logits_std': logits_std,
+                    'sigmoid_mean': sigmoid_mean,
+                    'bit_flip_image_delta': float('nan'),
+                    'bit_flip_logit_delta': float('nan'),
                     'lr': optimizer.param_groups[0]['lr'],
                     'noise_layer_type': active_noise_type,
                 }
-                train_writer.writerow(log_data)
-                train_csv.flush()
-
-                print(
-                    f"[E{epoch:03d}|S{global_step:06d}] "
-                    f"L={loss_total.item():.4f} "
-                    f"(diff={loss_diff.item():.4f} img={loss_img.item():.4f} "
-                    f"wm={loss_wm.item():.4f} delta={loss_delta.item():.4f}) "
-                    f"lambda=({lambda_diff:.2f},{lambda_img:.2f},{lambda_wm:.2f}) "
-                    f"lambda_delta={lambda_delta:.2f} "
-                    f"bit_acc={bit_acc:.3f} PSNR={psnr_val:.1f} "
-                    f"noise_layer={noise_type}"
-                )
 
                 if debug_interval > 0 and global_step % debug_interval == 0:
                     with torch.no_grad():
@@ -888,14 +936,40 @@ def train(config):
                             diffusion, debug_x_t, debug_t, pred_noise_b
                         )
                         pred_x0_delta = (pred_x0_a - pred_x0_b).abs().mean().item()
+                        logits_a = decoder(pred_x0_a.clamp(-1, 1))
+                        logits_b = decoder(pred_x0_b.clamp(-1, 1))
+                        bit_flip_logit_delta = (logits_a - logits_b).abs().mean().item()
+                        log_data['bit_flip_image_delta'] = pred_x0_delta
+                        log_data['bit_flip_logit_delta'] = bit_flip_logit_delta
 
                     print(
                         f"[Debug S{global_step:06d}] "
                         f"logits_std={logits_std:.4f} "
                         f"sigmoid_mean={sigmoid_mean:.4f} "
-                        f"delta={pred_x0_delta:.6f} "
+                        f"image_delta={pred_x0_delta:.6f} "
+                        f"logit_delta={bit_flip_logit_delta:.6f} "
                         f"gn(model={model_gn:.3f},dec={decoder_gn:.3f},"
                         f"wm={wm_mlp_gn:.3f},map={wm_map_mlp_gn:.3f})"
+                    )
+
+                train_writer.writerow(log_data)
+                train_csv.flush()
+
+                print(
+                    f"[E{epoch:03d}|S{global_step:06d}] "
+                    f"L={loss_total.item():.4f} "
+                    f"(diff={loss_diff.item():.4f} img={loss_img.item():.4f} "
+                    f"wm={loss_wm.item():.4f} delta={loss_delta.item():.4f}) "
+                    f"lambda=({lambda_diff:.2f},{lambda_img:.2f},{lambda_wm:.2f}) "
+                    f"lambda_delta={lambda_delta:.2f} "
+                    f"bit_acc={bit_acc:.3f} PSNR={psnr_val:.1f} "
+                    f"logits_std={logits_std:.4f} sigmoid_mean={sigmoid_mean:.4f} "
+                    f"noise_layer={noise_type}"
+                )
+                if psnr_val > 45.0 and bit_acc < 0.6:
+                    print(
+                        "[WARNING] High PSNR but watermark is not learning; "
+                        "the model may be collapsing to near-identity images."
                     )
 
             # ========================================================
@@ -907,7 +981,13 @@ def train(config):
                     # Take a batch for sampling
                     sample_batch = next(iter(train_loader))
                     s_cover = sample_batch['image'][:4].to(device)
-                    s_wm = sample_batch['wm_bits'][:4].to(device)
+                    s_wm = generate_val_watermark(
+                        s_cover.size(0),
+                        watermark_length,
+                        watermark_seed,
+                        device,
+                        offset=global_step,
+                    )
 
                     # Generate watermarked images via full reverse sampling
                     s_watermarked = embed_watermark(
@@ -969,8 +1049,14 @@ def train(config):
         with torch.no_grad():
             for v_batch in val_loader:
                 v_cover = v_batch['image'].to(device)
-                v_wm = v_batch['wm_bits'].to(device)
                 B_v = v_cover.size(0)
+                v_wm = generate_val_watermark(
+                    B_v,
+                    watermark_length,
+                    watermark_seed,
+                    device,
+                    offset=global_step + len(val_bit_acc_clean),
+                )
 
                 # ---- Single-step pred_x0 validation ----
                 t_eval = torch.randint(wm_t_min, wm_t_max, (B_v,), device=device).long()
@@ -1101,6 +1187,7 @@ def train(config):
         # DIAGNOSTIC: If bit_acc stays near 0.5, print warning
         # ============================================================
         if avg_acc_clean < 0.55 and epoch > 10:
+            current_weights = get_loss_weights(cfg, global_step)
             print(
                 "[DIAGNOSTIC] bit_acc_clean is near 0.5. Possible causes:\n"
                 "  1. wm_bits not actually fed to U-Net? Check watermark_mlp.\n"
@@ -1108,7 +1195,9 @@ def train(config):
                 "  3. loss_wm backprop to diffusion_model? Check no .detach().\n"
                 "  4. decoder input range correct [-1, 1]?\n"
                 "  5. lambda_wm too small? Current: {:.1f}\n"
-                "  6. wm_t_max too large? Current: {}".format(lambda_wm, wm_t_max)
+                "  6. wm_t_max too large? Current: {}".format(
+                    current_weights['lambda_wm'], wm_t_max
+                )
             )
 
     # --- End training ---

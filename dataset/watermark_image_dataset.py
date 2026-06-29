@@ -35,8 +35,11 @@ class WatermarkImageDataset(Dataset):
         self.image_size = image_size
         self.watermark_length = watermark_length
         self.watermark_seed = watermark_seed
-        if watermark_mode not in {'fixed', 'per_epoch'}:
-            raise ValueError("watermark_mode must be 'fixed' or 'per_epoch'")
+        if watermark_mode not in {'fixed', 'per_epoch', 'random', 'deterministic_random'}:
+            raise ValueError(
+                "watermark_mode must be 'fixed', 'per_epoch', 'random', "
+                "or 'deterministic_random'"
+            )
         self.watermark_mode = watermark_mode
         self.epoch = 0
         self.is_train = is_train
@@ -81,7 +84,12 @@ class WatermarkImageDataset(Dataset):
         relative_path = os.path.relpath(img_path, self.data_dir).replace('\\', '/')
         bits = []
         counter = 0
-        epoch_key = self.epoch if self.watermark_mode == 'per_epoch' else 'fixed'
+        if self.watermark_mode == 'per_epoch':
+            epoch_key = self.epoch
+        elif self.watermark_mode == 'random':
+            epoch_key = f"random:{self.epoch}"
+        else:
+            epoch_key = 'deterministic_random'
         while len(bits) < self.watermark_length:
             payload = (
                 f"{self.watermark_seed}:{epoch_key}:{relative_path}:{counter}"

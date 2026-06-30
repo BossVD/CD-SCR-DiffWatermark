@@ -5,8 +5,12 @@ __pycache__/
 
 # Runtime outputs and experiment artifacts
 outputs/
+outputs_stage*/
 checkpoints/
+checkpoints_stage*/
 data/
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
 
 # Local environment files
 .env

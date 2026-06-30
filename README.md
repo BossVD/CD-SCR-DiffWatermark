@@ -58,9 +58,9 @@ COCO 2017 数据集目录结构：
 
 目的：让模型学会在不加噪声层的情况下嵌入并提取水印。
 
-```bash
-python train_watermark_diffusion.py --config configs/watermark_stage1.yaml
-```
+Stage 1 现在分为 `warmup -> balance -> full` 三个训练阶段。阶段参数统一写在
+`configs/watermark_stage1.yaml` 的 `train.stages` 下，当前生效阶段由
+`train.stage` 指定。
 
 Stage 1 默认启用两条水印注入路径：
 
@@ -69,7 +69,118 @@ Stage 1 默认启用两条水印注入路径：
 
 当前 decoder 固定使用默认的 residual multi-scale decoder，输出仍为 raw logits，训练继续使用 `BCEWithLogitsLoss`。
 
-关键观测指标：`bit_acc_clean` 应显著高于 0.5 并逐步达到 0.85+，`loss_wm` 持续下降，`PSNR` 稳定。训练日志会输出 logits 统计、梯度范数和 `pred_x0_delta_same_cover_diff_wm`，用于判断模型是否真的使用 `wm_bits`。
+关键观测指标：`bit_acc_clean` 应显著高于 0.5 并逐步达到 0.85+，`loss_wm` 持续下降，`PSNR` 稳定。训练日志会输出 `logits_std`、`sigmoid_mean`、梯度范数、`bit_flip_image_delta` 和 `bit_flip_logit_delta`，用于判断模型是否真的使用 `wm_bits`。
+
+### Stage 1 三阶段训练流程
+
+#### 1. Warmup：先建立水印通信链路
+
+配置文件当前默认就是 warmup：
+
+```yaml
+train:
+  stage: warmup
+```
+
+启动训练：
+
+```bash
+python train_watermark_diffusion.py --config configs/watermark_stage1.yaml
+```
+
+warmup 阶段只强调“写水印 + 读水印”，不追求最终图像质量。建议达到以下条件后再切换：
+
+- `train bit_acc > 0.90`
+- `val bit_acc_clean > 0.75`
+- `loss_wm < 0.30` 左右
+- `PSNR` 不要明显崩坏，通常保持在 `25~40` 区间即可
+
+如果只有 train acc 上升、val acc 仍接近 0.5，说明只是记住训练集，不建议进入下一阶段。
+
+#### 2. Balance：恢复图像质量并逐步加入 diffusion 约束
+
+把 `configs/watermark_stage1.yaml` 改为：
+
+```yaml
+train:
+  stage: balance
+```
+
+然后用 warmup 的最佳 checkpoint 初始化新阶段：
+
+```bash
+python train_watermark_diffusion.py \
+  --config configs/watermark_stage1.yaml \
+  --init_from checkpoints_stage1/best.pt
+```
+
+注意：阶段切换使用 `--init_from`，不要用 `--resume`。
+
+- `--init_from`：从上一阶段权重初始化一个新阶段，不继承 epoch、global_step、optimizer。
+- `--resume`：同一个阶段中断后继续训练，会恢复 epoch、global_step、optimizer 和随机状态。
+
+balance 阶段的 loss 会按 step 从 YAML 中自动读取：
+
+```yaml
+train:
+  stages:
+    balance:
+      loss_schedule:
+        - until_step: 3000
+          lambda_diff: 0.0
+          lambda_img: 0.1
+          lambda_wm: 20.0
+          lambda_delta: 0.0
+        - until_step: 8000
+          lambda_diff: 0.0
+          lambda_img: 0.5
+          lambda_wm: 12.0
+          lambda_delta: 0.0
+        - until_step: -1
+          lambda_diff: 0.1
+          lambda_img: 1.0
+          lambda_wm: 8.0
+          lambda_delta: 0.0
+```
+
+#### 3. Full：最终 Stage 1 收敛
+
+如果 balance 阶段的水印准确率稳定、图像质量也恢复，再切到 full：
+
+```yaml
+train:
+  stage: full
+```
+
+继续从 balance 的最佳 checkpoint 初始化：
+
+```bash
+python train_watermark_diffusion.py \
+  --config configs/watermark_stage1.yaml \
+  --init_from checkpoints_stage1/best.pt
+```
+
+full 阶段参数同样来自 YAML：
+
+```yaml
+train:
+  stages:
+    full:
+      lambda_diff: 0.3
+      lambda_img: 1.5
+      lambda_wm: 6.0
+      lambda_delta: 0.01
+```
+
+### 中断后恢复当前阶段
+
+如果只是当前阶段训练中断，不切换阶段，使用：
+
+```bash
+python train_watermark_diffusion.py \
+  --config configs/watermark_stage1.yaml \
+  --resume checkpoints_stage1/latest.pt
+```
 
 ### Stage 1 配置要点
 
@@ -86,25 +197,19 @@ model:
 noise_layer:
   type: none             # 关闭所有退化层
 train:
+  stage: warmup
   lr: 0.0001
-  lambda_wm: 5.0
+  lambda_wm: 20.0
   epochs: 50
   log_interval: 100
   debug_interval: 500
-  use_loss_schedule: true
-  loss_schedule:
-    - until_step: 2000
+  use_loss_schedule: false
+  stages:
+    warmup:
       lambda_diff: 0.0
-      lambda_img: 0.2
-      lambda_wm: 10.0
-    - until_step: 5000
-      lambda_diff: 0.5
-      lambda_img: 0.5
-      lambda_wm: 8.0
-    - until_step: -1
-      lambda_diff: 1.0
-      lambda_img: 1.0
-      lambda_wm: 5.0
+      lambda_img: 0.1
+      lambda_wm: 20.0
+      lambda_delta: 0.0
 decoder:
   type: residual_multiscale
   base_channels: 32
@@ -114,7 +219,7 @@ decoder:
   use_multiscale: true
 diffusion:
   wm_t_min: 0
-  wm_t_max: 200
+  wm_t_max: 20
   train_t_start: 200
 output:
   checkpoint_dir: ./checkpoints_stage1

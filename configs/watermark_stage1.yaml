@@ -52,6 +52,10 @@ train:
   lambda_img: 0.1
   lambda_wm: 20.0
   lambda_delta: 0.0
+  lambda_tv: 0.0
+  lambda_topk: 0.0
+  lambda_channel: 0.0
+  topk_delta_fraction: 0.01
 
   use_loss_schedule: false
   loss_schedule: []
@@ -62,6 +66,9 @@ train:
       lambda_img: 0.1
       lambda_wm: 20.0
       lambda_delta: 0.0
+      lambda_tv: 0.0
+      lambda_topk: 0.0
+      lambda_channel: 0.0
 
     balance:
       loss_schedule:
@@ -70,22 +77,34 @@ train:
           lambda_img: 0.1
           lambda_wm: 20.0
           lambda_delta: 0.0
+          lambda_tv: 0.0
+          lambda_topk: 0.0
+          lambda_channel: 0.0
         - until_step: 5500
           lambda_diff: 0.0
           lambda_img: 0.5
           lambda_wm: 12.0
           lambda_delta: 0.0
+          lambda_tv: 0.0
+          lambda_topk: 0.0
+          lambda_channel: 0.0
         - until_step: -1
           lambda_diff: 0.1
           lambda_img: 1.0
           lambda_wm: 8.0
           lambda_delta: 0.0
+          lambda_tv: 0.0
+          lambda_topk: 0.0
+          lambda_channel: 0.0
 
     full:
       lambda_diff: 0.3
       lambda_img: 3.0
       lambda_wm: 3.0
-      lambda_delta: 0.03
+      lambda_delta: 0.05
+      lambda_tv: 0.2
+      lambda_topk: 0.5
+      lambda_channel: 0.2
 
   save_interval: 1
   sample_interval: 5000

@@ -57,6 +57,26 @@ def compute_psnr(pred, target, max_val=1.0):
     return (20 * math.log10(max_val) - 10 * math.log10(mse.item()))
 
 
+def residual_tv_loss(delta):
+    """Penalize short, high-frequency residual streaks."""
+    loss_h = (delta[:, :, 1:, :] - delta[:, :, :-1, :]).abs().mean()
+    loss_w = (delta[:, :, :, 1:] - delta[:, :, :, :-1]).abs().mean()
+    return loss_h + loss_w
+
+
+def residual_topk_loss(delta, fraction=0.01):
+    """Penalize sparse, visually obvious residual spikes."""
+    flat = delta.abs().flatten(1)
+    k = max(1, int(flat.size(1) * fraction))
+    return flat.topk(k, dim=1).values.mean()
+
+
+def residual_channel_balance_loss(delta):
+    """Discourage hiding most residual energy in one color channel."""
+    channel_energy = delta.abs().mean(dim=(0, 2, 3))
+    return channel_energy.std(unbiased=False)
+
+
 def get_loss_weights(cfg, global_step):
     train_cfg = cfg.get('train', {})
     stage = str(train_cfg.get('stage', '')).lower()
@@ -80,12 +100,18 @@ def get_loss_weights(cfg, global_step):
                     'lambda_img': float(item.get('lambda_img', train_cfg['lambda_img'])),
                     'lambda_wm': float(item.get('lambda_wm', train_cfg['lambda_wm'])),
                     'lambda_delta': float(item.get('lambda_delta', train_cfg.get('lambda_delta', 0.0))),
+                    'lambda_tv': float(item.get('lambda_tv', train_cfg.get('lambda_tv', 0.0))),
+                    'lambda_topk': float(item.get('lambda_topk', train_cfg.get('lambda_topk', 0.0))),
+                    'lambda_channel': float(item.get('lambda_channel', train_cfg.get('lambda_channel', 0.0))),
                 }
     return {
         'lambda_diff': float(train_cfg['lambda_diff']),
         'lambda_img': float(train_cfg['lambda_img']),
         'lambda_wm': float(train_cfg['lambda_wm']),
         'lambda_delta': float(train_cfg.get('lambda_delta', 0.0)),
+        'lambda_tv': float(train_cfg.get('lambda_tv', 0.0)),
+        'lambda_topk': float(train_cfg.get('lambda_topk', 0.0)),
+        'lambda_channel': float(train_cfg.get('lambda_channel', 0.0)),
     }
 
 
@@ -95,6 +121,9 @@ def _loss_weight_dict(source, fallback):
         'lambda_img': float(source.get('lambda_img', fallback.get('lambda_img', 0.0))),
         'lambda_wm': float(source.get('lambda_wm', fallback.get('lambda_wm', 0.0))),
         'lambda_delta': float(source.get('lambda_delta', fallback.get('lambda_delta', 0.0))),
+        'lambda_tv': float(source.get('lambda_tv', fallback.get('lambda_tv', 0.0))),
+        'lambda_topk': float(source.get('lambda_topk', fallback.get('lambda_topk', 0.0))),
+        'lambda_channel': float(source.get('lambda_channel', fallback.get('lambda_channel', 0.0))),
     }
 
 
@@ -693,7 +722,8 @@ def train(config):
     train_csv = open(train_log_path, csv_mode, newline='')
     train_writer = csv.DictWriter(train_csv, fieldnames=[
         'epoch', 'global_step', 'loss_total', 'loss_diff', 'loss_img', 'loss_wm',
-        'loss_delta', 'bit_acc', 'psnr', 'logits_std', 'sigmoid_mean',
+        'loss_delta', 'loss_tv', 'loss_topk', 'loss_channel',
+        'bit_acc', 'psnr', 'logits_std', 'sigmoid_mean',
         'bit_flip_image_delta', 'bit_flip_logit_delta', 'lr', 'noise_layer_type',
     ])
     if not os.path.exists(train_log_path) or os.path.getsize(train_log_path) == 0:
@@ -714,6 +744,9 @@ def train(config):
         'psnr_watermarked', 'psnr_degraded',
         'mae_watermarked', 'mae_degraded',
         'max_abs_delta_watermarked', 'max_abs_delta_degraded',
+        'topk_abs_delta_watermarked', 'tv_watermarked',
+        'channel_delta_r', 'channel_delta_g', 'channel_delta_b',
+        'channel_delta_std',
         'logits_std', 'sigmoid_mean',
     ])
     if not os.path.exists(sample_log_path) or os.path.getsize(sample_log_path) == 0:
@@ -729,7 +762,10 @@ def train(config):
         f"initial lambda_diff={initial_loss_weights['lambda_diff']}, "
         f"lambda_img={initial_loss_weights['lambda_img']}, "
         f"lambda_wm={initial_loss_weights['lambda_wm']}, "
-        f"lambda_delta={initial_loss_weights['lambda_delta']}"
+        f"lambda_delta={initial_loss_weights['lambda_delta']}, "
+        f"lambda_tv={initial_loss_weights['lambda_tv']}, "
+        f"lambda_topk={initial_loss_weights['lambda_topk']}, "
+        f"lambda_channel={initial_loss_weights['lambda_channel']}"
     )
     if cfg['train'].get('use_loss_schedule', False):
         print(f"[Train] loss schedule enabled: {cfg['train'].get('loss_schedule', [])}")
@@ -751,6 +787,9 @@ def train(config):
             lambda_img = loss_weights['lambda_img']
             lambda_wm = loss_weights['lambda_wm']
             lambda_delta = loss_weights['lambda_delta']
+            lambda_tv = loss_weights['lambda_tv']
+            lambda_topk = loss_weights['lambda_topk']
+            lambda_channel = loss_weights['lambda_channel']
 
             # ========================================================
             # Official PIMoG is either fully enabled or disabled.
@@ -814,6 +853,14 @@ def train(config):
 
                 # Unified degradation layers use [0, 1].
                 pred_x0_01 = (pred_x0 + 1.0) / 2.0
+                cover_01_for_loss = (cover_img + 1.0) / 2.0
+                residual_01 = pred_x0_01 - cover_01_for_loss
+                loss_tv = residual_tv_loss(residual_01)
+                loss_topk = residual_topk_loss(
+                    residual_01,
+                    cfg['train'].get('topk_delta_fraction', 0.01),
+                )
+                loss_channel = residual_channel_balance_loss(residual_01)
 
                 attacked_01 = noise_layer(pred_x0_01).float()
                 if noise_type == 'mixed':
@@ -835,6 +882,9 @@ def train(config):
                 lambda_img * loss_img
                 + lambda_wm * loss_wm
                 + lambda_delta * loss_delta
+                + lambda_tv * loss_tv
+                + lambda_topk * loss_topk
+                + lambda_channel * loss_channel
             )
 
             # ========================================================
@@ -870,6 +920,9 @@ def train(config):
                 + lambda_img * loss_img.detach()
                 + lambda_wm * loss_wm.detach()
                 + lambda_delta * loss_delta.detach()
+                + lambda_tv * loss_tv.detach()
+                + lambda_topk * loss_topk.detach()
+                + lambda_channel * loss_channel.detach()
             )
 
             # ========================================================
@@ -894,6 +947,9 @@ def train(config):
                     'loss_img': loss_img.item(),
                     'loss_wm': loss_wm.item(),
                     'loss_delta': loss_delta.item(),
+                    'loss_tv': loss_tv.item(),
+                    'loss_topk': loss_topk.item(),
+                    'loss_channel': loss_channel.item(),
                     'bit_acc': bit_acc,
                     'psnr': psnr_val,
                     'logits_std': logits_std,
@@ -955,9 +1011,12 @@ def train(config):
                     f"[E{epoch:03d}|S{global_step:06d}] "
                     f"L={loss_total.item():.4f} "
                     f"(diff={loss_diff.item():.4f} img={loss_img.item():.4f} "
-                    f"wm={loss_wm.item():.4f} delta={loss_delta.item():.4f}) "
+                    f"wm={loss_wm.item():.4f} delta={loss_delta.item():.4f} "
+                    f"tv={loss_tv.item():.4f} topk={loss_topk.item():.4f} "
+                    f"ch={loss_channel.item():.4f}) "
                     f"lambda=({lambda_diff:.2f},{lambda_img:.2f},{lambda_wm:.2f}) "
                     f"lambda_delta={lambda_delta:.2f} "
+                    f"lambda_visual=({lambda_tv:.2f},{lambda_topk:.2f},{lambda_channel:.2f}) "
                     f"bit_acc={bit_acc:.3f} PSNR={psnr_val:.1f} "
                     f"logits_std={logits_std:.4f} sigmoid_mean={sigmoid_mean:.4f} "
                     f"noise_layer={noise_type}"
@@ -1015,6 +1074,13 @@ def train(config):
                     s_mae_deg = s_delta_deg.mean().item()
                     s_max_delta_wm = s_delta_wm.max().item()
                     s_max_delta_deg = s_delta_deg.max().item()
+                    s_topk_delta_wm = residual_topk_loss(
+                        s_wm_01 - s_cover_01,
+                        cfg['train'].get('topk_delta_fraction', 0.01),
+                    ).item()
+                    s_tv_wm = residual_tv_loss(s_wm_01 - s_cover_01).item()
+                    s_channel_delta = s_delta_wm.mean(dim=(0, 2, 3))
+                    s_channel_delta_std = s_channel_delta.std(unbiased=False).item()
 
                     sample_writer.writerow({
                         'epoch': epoch,
@@ -1027,6 +1093,12 @@ def train(config):
                         'mae_degraded': s_mae_deg,
                         'max_abs_delta_watermarked': s_max_delta_wm,
                         'max_abs_delta_degraded': s_max_delta_deg,
+                        'topk_abs_delta_watermarked': s_topk_delta_wm,
+                        'tv_watermarked': s_tv_wm,
+                        'channel_delta_r': s_channel_delta[0].item(),
+                        'channel_delta_g': s_channel_delta[1].item(),
+                        'channel_delta_b': s_channel_delta[2].item(),
+                        'channel_delta_std': s_channel_delta_std,
                         'logits_std': s_logits_std,
                         'sigmoid_mean': s_sigmoid_mean,
                     })
@@ -1045,6 +1117,10 @@ def train(config):
                         f"(noise={sample_noise_type}, bit_acc={s_acc:.3f}, "
                         f"psnr_wm={s_psnr_wm:.2f}, psnr_deg={s_psnr_deg:.2f}, "
                         f"mae_wm={s_mae_wm:.4f}, max_delta_wm={s_max_delta_wm:.4f}, "
+                        f"topk_delta_wm={s_topk_delta_wm:.4f}, tv_wm={s_tv_wm:.4f}, "
+                        f"channel_delta=({s_channel_delta[0].item():.4f},"
+                        f"{s_channel_delta[1].item():.4f},"
+                        f"{s_channel_delta[2].item():.4f}), "
                         f"logits_std={s_logits_std:.4f}, sigmoid_mean={s_sigmoid_mean:.4f})"
                     )
 

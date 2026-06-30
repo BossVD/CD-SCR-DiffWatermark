@@ -33,7 +33,7 @@ diffusion:
   timesteps: 1000
   beta_schedule: linear
   wm_t_min: 0
-  wm_t_max: 20
+  wm_t_max: 200
   train_t_start: 200
   sample_steps: 100
 
@@ -70,7 +70,7 @@ train:
           lambda_img: 0.1
           lambda_wm: 20.0
           lambda_delta: 0.0
-        - until_step: 8000
+        - until_step: 5500
           lambda_diff: 0.0
           lambda_img: 0.5
           lambda_wm: 12.0

@@ -687,6 +687,7 @@ def train(config):
     # --- CSV loggers ---
     train_log_path = os.path.join(log_dir, 'train_log.csv')
     val_log_path = os.path.join(log_dir, 'val_log.csv')
+    sample_log_path = os.path.join(log_dir, 'sample_log.csv')
 
     csv_mode = 'a' if resume_path else 'w'
     train_csv = open(train_log_path, csv_mode, newline='')
@@ -706,6 +707,17 @@ def train(config):
     ])
     if not os.path.exists(val_log_path) or os.path.getsize(val_log_path) == 0:
         val_writer.writeheader()
+
+    sample_csv = open(sample_log_path, csv_mode, newline='')
+    sample_writer = csv.DictWriter(sample_csv, fieldnames=[
+        'epoch', 'global_step', 'noise_layer_type', 'bit_acc',
+        'psnr_watermarked', 'psnr_degraded',
+        'mae_watermarked', 'mae_degraded',
+        'max_abs_delta_watermarked', 'max_abs_delta_degraded',
+        'logits_std', 'sigmoid_mean',
+    ])
+    if not os.path.exists(sample_log_path) or os.path.getsize(sample_log_path) == 0:
+        sample_writer.writeheader()
 
     # --- Training loop ---
     print(
@@ -991,17 +1003,49 @@ def train(config):
                     s_logits = decoder(s_decoder_input)
                     s_bits = (torch.sigmoid(s_logits) > 0.5).float()
                     s_acc = (s_bits == s_wm).float().mean().item()
+                    s_sigmoid = torch.sigmoid(s_logits)
+                    s_logits_std = s_logits.detach().std().item()
+                    s_sigmoid_mean = s_sigmoid.detach().mean().item()
+
+                    s_delta_wm = (s_wm_01 - s_cover_01).abs()
+                    s_delta_deg = (s_degraded_01 - s_cover_01).abs()
+                    s_psnr_wm = compute_psnr(s_wm_01, s_cover_01, max_val=1.0)
+                    s_psnr_deg = compute_psnr(s_degraded_01, s_cover_01, max_val=1.0)
+                    s_mae_wm = s_delta_wm.mean().item()
+                    s_mae_deg = s_delta_deg.mean().item()
+                    s_max_delta_wm = s_delta_wm.max().item()
+                    s_max_delta_deg = s_delta_deg.max().item()
+
+                    sample_writer.writerow({
+                        'epoch': epoch,
+                        'global_step': global_step,
+                        'noise_layer_type': sample_noise_type,
+                        'bit_acc': s_acc,
+                        'psnr_watermarked': s_psnr_wm,
+                        'psnr_degraded': s_psnr_deg,
+                        'mae_watermarked': s_mae_wm,
+                        'mae_degraded': s_mae_deg,
+                        'max_abs_delta_watermarked': s_max_delta_wm,
+                        'max_abs_delta_degraded': s_max_delta_deg,
+                        'logits_std': s_logits_std,
+                        'sigmoid_mean': s_sigmoid_mean,
+                    })
+                    sample_csv.flush()
 
                     # Save comparison grid
                     comparison = torch.cat([s_cover_01, s_wm_01, s_degraded_01], dim=0)
                     save_path = os.path.join(
                         sample_dir,
-                        f'step_{global_step:06d}_{sample_noise_type}_acc_{s_acc:.3f}.png',
+                        f'step_{global_step:06d}_{sample_noise_type}'
+                        f'_acc_{s_acc:.3f}_psnr_{s_psnr_wm:.2f}.png',
                     )
                     save_image(comparison, save_path, nrow=4)
                     print(
                         f"[Sample] Saved {save_path} "
-                        f"(noise={sample_noise_type}, bit_acc={s_acc:.3f})"
+                        f"(noise={sample_noise_type}, bit_acc={s_acc:.3f}, "
+                        f"psnr_wm={s_psnr_wm:.2f}, psnr_deg={s_psnr_deg:.2f}, "
+                        f"mae_wm={s_mae_wm:.4f}, max_delta_wm={s_max_delta_wm:.4f}, "
+                        f"logits_std={s_logits_std:.4f}, sigmoid_mean={s_sigmoid_mean:.4f})"
                     )
 
                     # Also save individual images
@@ -1187,6 +1231,7 @@ def train(config):
     # --- End training ---
     train_csv.close()
     val_csv.close()
+    sample_csv.close()
     print(f"[Train] Done! Logs saved to {log_dir}")
 
     # Save final checkpoint

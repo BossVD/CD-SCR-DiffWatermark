@@ -60,41 +60,16 @@ def compute_psnr(pred, target, max_val=1.0):
 def get_loss_weights(cfg, global_step):
     train_cfg = cfg.get('train', {})
     stage = str(train_cfg.get('stage', '')).lower()
-    if stage == 'warmup':
-        return {
-            'lambda_diff': 0.0,
-            'lambda_img': 0.1,
-            'lambda_wm': 20.0,
-            'lambda_delta': 0.0,
-        }
-    if stage == 'balance':
-        if global_step < 3000:
-            return {
-                'lambda_diff': 0.0,
-                'lambda_img': 0.1,
-                'lambda_wm': 20.0,
-                'lambda_delta': 0.0,
-            }
-        if global_step < 8000:
-            return {
-                'lambda_diff': 0.0,
-                'lambda_img': 0.5,
-                'lambda_wm': 12.0,
-                'lambda_delta': 0.0,
-            }
-        return {
-            'lambda_diff': 0.1,
-            'lambda_img': 1.0,
-            'lambda_wm': 8.0,
-            'lambda_delta': 0.0,
-        }
-    if stage == 'full':
-        return {
-            'lambda_diff': 0.3,
-            'lambda_img': 1.5,
-            'lambda_wm': 6.0,
-            'lambda_delta': 0.01,
-        }
+    stages_cfg = train_cfg.get('stages', {})
+    if stage and stage in stages_cfg:
+        stage_cfg = stages_cfg[stage] or {}
+        schedule = stage_cfg.get('loss_schedule')
+        if schedule:
+            for item in schedule:
+                until_step = int(item.get('until_step', -1))
+                if until_step < 0 or global_step < until_step:
+                    return _loss_weight_dict(item, stage_cfg)
+        return _loss_weight_dict(stage_cfg, train_cfg)
 
     if train_cfg.get('use_loss_schedule', False):
         for item in train_cfg.get('loss_schedule', []):
@@ -111,6 +86,15 @@ def get_loss_weights(cfg, global_step):
         'lambda_img': float(train_cfg['lambda_img']),
         'lambda_wm': float(train_cfg['lambda_wm']),
         'lambda_delta': float(train_cfg.get('lambda_delta', 0.0)),
+    }
+
+
+def _loss_weight_dict(source, fallback):
+    return {
+        'lambda_diff': float(source.get('lambda_diff', fallback.get('lambda_diff', 0.0))),
+        'lambda_img': float(source.get('lambda_img', fallback.get('lambda_img', 0.0))),
+        'lambda_wm': float(source.get('lambda_wm', fallback.get('lambda_wm', 0.0))),
+        'lambda_delta': float(source.get('lambda_delta', fallback.get('lambda_delta', 0.0))),
     }
 
 

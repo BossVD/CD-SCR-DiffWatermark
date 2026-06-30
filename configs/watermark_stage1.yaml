@@ -56,6 +56,37 @@ train:
   use_loss_schedule: false
   loss_schedule: []
 
+  stages:
+    warmup:
+      lambda_diff: 0.0
+      lambda_img: 0.1
+      lambda_wm: 20.0
+      lambda_delta: 0.0
+
+    balance:
+      loss_schedule:
+        - until_step: 3000
+          lambda_diff: 0.0
+          lambda_img: 0.1
+          lambda_wm: 20.0
+          lambda_delta: 0.0
+        - until_step: 8000
+          lambda_diff: 0.0
+          lambda_img: 0.5
+          lambda_wm: 12.0
+          lambda_delta: 0.0
+        - until_step: -1
+          lambda_diff: 0.1
+          lambda_img: 1.0
+          lambda_wm: 8.0
+          lambda_delta: 0.0
+
+    full:
+      lambda_diff: 0.3
+      lambda_img: 1.5
+      lambda_wm: 6.0
+      lambda_delta: 0.01
+
   save_interval: 1
   sample_interval: 5000
   log_interval: 100

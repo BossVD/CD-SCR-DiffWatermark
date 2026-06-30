@@ -83,9 +83,9 @@ train:
 
     full:
       lambda_diff: 0.3
-      lambda_img: 1.5
-      lambda_wm: 6.0
-      lambda_delta: 0.01
+      lambda_img: 3.0
+      lambda_wm: 3.0
+      lambda_delta: 0.03
 
   save_interval: 1
   sample_interval: 5000

@@ -42,7 +42,7 @@ train:
   deterministic: true
   batch_size: 16
   num_workers: 8
-  lr: 0.00005
+  lr: 0.00003
   epochs: 60
   device: cuda
   use_amp: true
@@ -50,12 +50,14 @@ train:
 
   lambda_diff: 0.05
   lambda_img: 1.5
-  lambda_wm: 8.0
+  lambda_wm: 6.0
   lambda_delta: 0.02
   lambda_tv: 0.05
   lambda_topk: 0.10
   lambda_channel: 0.05
   topk_delta_fraction: 0.01
+  max_grad_norm: 1.0
+  skip_nonfinite: true
 
   use_loss_schedule: false
   loss_schedule: []
@@ -206,7 +208,7 @@ noise_layer:
 
   mixed:
     candidates: [pimog, oled, led, projector]
-    probs: [0.25, 0.25, 0.25, 0.25]
+    probs: [0.35, 0.30, 0.20, 0.15]
 
 output:
   checkpoint_dir: ./checkpoints_stage2_mixed

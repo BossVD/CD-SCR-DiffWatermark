@@ -149,6 +149,32 @@ def grad_norm(module):
         has_grad = True
     return math.sqrt(total) if has_grad else float('nan')
 
+
+def tensor_is_finite(value):
+    """Return True when a scalar/tensor contains only finite values."""
+    if torch.is_tensor(value):
+        return torch.isfinite(value.detach()).all().item()
+    return math.isfinite(float(value))
+
+
+def first_nonfinite_tensor(named_tensors):
+    """Return the first non-finite tensor name, or None if all are finite."""
+    for name, value in named_tensors:
+        if not tensor_is_finite(value):
+            return name
+    return None
+
+
+def gradients_are_finite(parameters):
+    """Check all existing gradients for trainable parameters."""
+    for index, param in enumerate(parameters):
+        if not param.requires_grad or param.grad is None:
+            continue
+        if not torch.isfinite(param.grad.detach()).all().item():
+            return False, f'grad_{index}_nonfinite'
+    return True, None
+
+
 # ============================================================
 # Helper: predict x0 from noise prediction
 # ============================================================
@@ -713,6 +739,11 @@ def train(config):
     sample_interval = cfg['train']['sample_interval']
     log_interval = cfg['train']['log_interval']
     debug_interval = cfg['train'].get('debug_interval', log_interval * 5)
+    max_grad_norm = float(cfg['train'].get('max_grad_norm', 1.0))
+    skip_nonfinite = bool(cfg['train'].get('skip_nonfinite', True))
+    trainable_parameters = [
+        param for group in optimizer.param_groups for param in group['params']
+    ]
     # --- CSV loggers ---
     train_log_path = os.path.join(log_dir, 'train_log.csv')
     val_log_path = os.path.join(log_dir, 'val_log.csv')
@@ -725,6 +756,7 @@ def train(config):
         'loss_delta', 'loss_tv', 'loss_topk', 'loss_channel',
         'bit_acc', 'psnr', 'logits_std', 'sigmoid_mean',
         'bit_flip_image_delta', 'bit_flip_logit_delta', 'lr', 'noise_layer_type',
+        'skipped', 'skip_reason', 'grad_norm_clipped',
     ])
     if not os.path.exists(train_log_path) or os.path.getsize(train_log_path) == 0:
         train_writer.writeheader()
@@ -752,6 +784,43 @@ def train(config):
     if not os.path.exists(sample_log_path) or os.path.getsize(sample_log_path) == 0:
         sample_writer.writeheader()
 
+    skipped_steps = 0
+
+    def log_skipped_step(epoch, step, active_noise_type, reason,
+                         grad_norm_clipped=float('nan')):
+        nonlocal skipped_steps
+        skipped_steps += 1
+        optimizer.zero_grad(set_to_none=True)
+        train_writer.writerow({
+            'epoch': epoch,
+            'global_step': step,
+            'loss_total': float('nan'),
+            'loss_diff': float('nan'),
+            'loss_img': float('nan'),
+            'loss_wm': float('nan'),
+            'loss_delta': float('nan'),
+            'loss_tv': float('nan'),
+            'loss_topk': float('nan'),
+            'loss_channel': float('nan'),
+            'bit_acc': float('nan'),
+            'psnr': float('nan'),
+            'logits_std': float('nan'),
+            'sigmoid_mean': float('nan'),
+            'bit_flip_image_delta': float('nan'),
+            'bit_flip_logit_delta': float('nan'),
+            'lr': optimizer.param_groups[0]['lr'],
+            'noise_layer_type': active_noise_type,
+            'skipped': 1,
+            'skip_reason': reason,
+            'grad_norm_clipped': grad_norm_clipped,
+        })
+        train_csv.flush()
+        print(
+            f"[Skip NonFinite] step={step} noise_layer={active_noise_type} "
+            f"reason={reason} skipped_steps={skipped_steps} "
+            f"grad_norm={grad_norm_clipped}"
+        )
+
     # --- Training loop ---
     print(
         f"[Train] Starting training: {epochs} epochs, "
@@ -769,7 +838,11 @@ def train(config):
     )
     if cfg['train'].get('use_loss_schedule', False):
         print(f"[Train] loss schedule enabled: {cfg['train'].get('loss_schedule', [])}")
-    print(f"[Train] wm_t range: [{wm_t_min}, {wm_t_max}), noise_layer={noise_type}")
+    print(
+        f"[Train] wm_t range: [{wm_t_min}, {wm_t_max}), "
+        f"noise_layer={noise_type}, max_grad_norm={max_grad_norm}, "
+        f"skip_nonfinite={skip_nonfinite}"
+    )
 
     for epoch in range(start_epoch, epochs + 1):
         train_dataset.set_epoch(epoch)
@@ -817,6 +890,21 @@ def train(config):
             # Backpropagate this branch immediately so its large U-Net
             # activation graph is released before the watermark branch.
             diffusion_objective = lambda_diff * loss_diff
+            if skip_nonfinite:
+                nonfinite_name = first_nonfinite_tensor([
+                    ('loss_diff', loss_diff),
+                    ('diffusion_objective', diffusion_objective),
+                ])
+                if nonfinite_name is not None:
+                    log_skipped_step(
+                        epoch,
+                        global_step,
+                        active_noise_type,
+                        f'{nonfinite_name}_nan',
+                    )
+                    global_step += 1
+                    continue
+
             if lambda_diff > 0:
                 if scaler is not None:
                     scaler.scale(diffusion_objective).backward()
@@ -886,10 +974,30 @@ def train(config):
                 + lambda_topk * loss_topk
                 + lambda_channel * loss_channel
             )
+            if skip_nonfinite:
+                nonfinite_name = first_nonfinite_tensor([
+                    ('loss_img', loss_img),
+                    ('loss_wm', loss_wm),
+                    ('loss_delta', loss_delta),
+                    ('loss_tv', loss_tv),
+                    ('loss_topk', loss_topk),
+                    ('loss_channel', loss_channel),
+                    ('watermark_objective', watermark_objective),
+                ])
+                if nonfinite_name is not None:
+                    log_skipped_step(
+                        epoch,
+                        global_step,
+                        active_noise_type,
+                        f'{nonfinite_name}_nan',
+                    )
+                    global_step += 1
+                    continue
 
             # ========================================================
             # 4. Backward
             # ========================================================
+            grad_norm_clipped = float('nan')
             if scaler is not None:
                 scaler.scale(watermark_objective).backward()
                 scaler.unscale_(optimizer)
@@ -901,6 +1009,33 @@ def train(config):
                     if hasattr(model, 'watermark_map_mlp')
                     else float('nan')
                 )
+                grads_finite, grad_reason = gradients_are_finite(trainable_parameters)
+                if skip_nonfinite and not grads_finite:
+                    scaler.update()
+                    log_skipped_step(
+                        epoch,
+                        global_step,
+                        active_noise_type,
+                        grad_reason,
+                    )
+                    global_step += 1
+                    continue
+                grad_norm_clipped = torch.nn.utils.clip_grad_norm_(
+                    trainable_parameters,
+                    max_grad_norm,
+                )
+                grad_norm_clipped = float(grad_norm_clipped.detach().cpu().item())
+                if skip_nonfinite and not math.isfinite(grad_norm_clipped):
+                    scaler.update()
+                    log_skipped_step(
+                        epoch,
+                        global_step,
+                        active_noise_type,
+                        'clip_grad_norm_nonfinite',
+                        grad_norm_clipped,
+                    )
+                    global_step += 1
+                    continue
                 scaler.step(optimizer)
                 scaler.update()
             else:
@@ -913,6 +1048,31 @@ def train(config):
                     if hasattr(model, 'watermark_map_mlp')
                     else float('nan')
                 )
+                grads_finite, grad_reason = gradients_are_finite(trainable_parameters)
+                if skip_nonfinite and not grads_finite:
+                    log_skipped_step(
+                        epoch,
+                        global_step,
+                        active_noise_type,
+                        grad_reason,
+                    )
+                    global_step += 1
+                    continue
+                grad_norm_clipped = torch.nn.utils.clip_grad_norm_(
+                    trainable_parameters,
+                    max_grad_norm,
+                )
+                grad_norm_clipped = float(grad_norm_clipped.detach().cpu().item())
+                if skip_nonfinite and not math.isfinite(grad_norm_clipped):
+                    log_skipped_step(
+                        epoch,
+                        global_step,
+                        active_noise_type,
+                        'clip_grad_norm_nonfinite',
+                        grad_norm_clipped,
+                    )
+                    global_step += 1
+                    continue
                 optimizer.step()
 
             loss_total = (
@@ -958,6 +1118,9 @@ def train(config):
                     'bit_flip_logit_delta': float('nan'),
                     'lr': optimizer.param_groups[0]['lr'],
                     'noise_layer_type': active_noise_type,
+                    'skipped': 0,
+                    'skip_reason': '',
+                    'grad_norm_clipped': grad_norm_clipped,
                 }
 
                 if debug_interval > 0 and global_step % debug_interval == 0:
@@ -1001,7 +1164,8 @@ def train(config):
                         f"image_delta={pred_x0_delta:.6f} "
                         f"logit_delta={bit_flip_logit_delta:.6f} "
                         f"gn(model={model_gn:.3f},dec={decoder_gn:.3f},"
-                        f"wm={wm_mlp_gn:.3f},map={wm_map_mlp_gn:.3f})"
+                        f"wm={wm_mlp_gn:.3f},map={wm_map_mlp_gn:.3f},"
+                        f"clip={grad_norm_clipped:.3f})"
                     )
 
                 train_writer.writerow(log_data)
@@ -1019,7 +1183,8 @@ def train(config):
                     f"lambda_visual=({lambda_tv:.2f},{lambda_topk:.2f},{lambda_channel:.2f}) "
                     f"bit_acc={bit_acc:.3f} PSNR={psnr_val:.1f} "
                     f"logits_std={logits_std:.4f} sigmoid_mean={sigmoid_mean:.4f} "
-                    f"noise_layer={noise_type}"
+                    f"noise_layer={active_noise_type} grad_norm={grad_norm_clipped:.3f} "
+                    f"skipped_steps={skipped_steps}"
                 )
                 if psnr_val > 45.0 and bit_acc < 0.6:
                     print(
@@ -1233,6 +1398,22 @@ def train(config):
             f"bit_acc_deg={avg_acc_deg:.3f} "
             f"PSNR={avg_psnr:.1f}"
         )
+        validation_finite = all(
+            math.isfinite(value)
+            for value in [
+                avg_acc_clean,
+                avg_acc_deg,
+                avg_psnr,
+                avg_loss_clean,
+                avg_loss_deg,
+            ]
+        )
+        if not validation_finite:
+            print(
+                f"[Checkpoint Skip] epoch={epoch} reason=nonfinite_validation "
+                f"skipped_steps={skipped_steps}"
+            )
+            continue
 
         # ============================================================
         # Save checkpoint. Stage 1 selects clean accuracy; Stage 2 selects
@@ -1255,6 +1436,7 @@ def train(config):
             'bit_acc_clean': avg_acc_clean,
             'bit_acc_degraded': avg_acc_deg,
             'best_metric_name': best_metric_name,
+            'skipped_steps': skipped_steps,
         }
 
         # latest.pt follows save_interval.

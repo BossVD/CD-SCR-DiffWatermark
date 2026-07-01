@@ -2,10 +2,10 @@ data:
   train_dir: /root/autodl-tmp/datasets/train2017
   val_dir: /root/autodl-tmp/datasets/val2017
   image_size: 128
-  watermark_length: 64
+  watermark_length: 16
   watermark_seed: 42
-  train_watermark_mode: per_epoch
-  val_watermark_mode: fixed
+  train_watermark_mode: random
+  val_watermark_mode: deterministic_random
   max_train_images: 10000
   max_val_images: 1000
 
@@ -40,20 +40,58 @@ diffusion:
 train:
   seed: 42
   deterministic: true
-  batch_size: 32
+  batch_size: 16
   num_workers: 8
-  lr: 0.00005
-  epochs: 50
+  lr: 0.00003
+  epochs: 60
   device: cuda
   use_amp: true
+  stage: robust_mixed
 
-  lambda_diff: 1.0
+  lambda_diff: 0.05
   lambda_img: 1.5
-  lambda_wm: 5.0
+  lambda_wm: 8.0
+  lambda_delta: 0.02
+  lambda_tv: 0.05
+  lambda_topk: 0.10
+  lambda_channel: 0.05
+  topk_delta_fraction: 0.01
+
+  use_loss_schedule: false
+  loss_schedule: []
+
+  stages:
+    robust_mixed:
+      loss_schedule:
+        - until_step: 3000
+          lambda_diff: 0.00
+          lambda_img: 2.0
+          lambda_wm: 6.0
+          lambda_delta: 0.02
+          lambda_tv: 0.05
+          lambda_topk: 0.10
+          lambda_channel: 0.05
+        - until_step: 12000
+          lambda_diff: 0.03
+          lambda_img: 1.5
+          lambda_wm: 8.0
+          lambda_delta: 0.02
+          lambda_tv: 0.05
+          lambda_topk: 0.10
+          lambda_channel: 0.05
+        - until_step: -1
+          lambda_diff: 0.05
+          lambda_img: 1.2
+          lambda_wm: 10.0
+          lambda_delta: 0.03
+          lambda_tv: 0.08
+          lambda_topk: 0.15
+          lambda_channel: 0.08
 
   save_interval: 1
   sample_interval: 5000
   log_interval: 100
+  debug_interval: 500
   reset_decoder: false
 
 # Stage 2 starts from a Stage 1 checkpoint and trains robustness under a
@@ -168,7 +206,7 @@ noise_layer:
 
   mixed:
     candidates: [pimog, oled, led, projector]
-    probs: [0.25, 0.25, 0.25, 0.25]
+    probs: [0.15, 0.30, 0.30, 0.25]
 
 output:
   checkpoint_dir: ./checkpoints_stage2_mixed

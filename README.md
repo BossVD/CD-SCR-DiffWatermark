@@ -1,407 +1,517 @@
-﻿# WaDiff — 基于扩散模型的水印嵌入与屏摄鲁棒性实验
+# WaDiff - Watermark-Conditioned Diffusion Experiment
 
-## 核心思路
+WaDiff 是一个面向抗屏摄水印的扩散模型实验框架。核心思想是：以已有载体图像为条件，通过 watermark-conditioned diffusion model 做内容保持的重绘式水印嵌入，使水印信息不再只是简单叠加的像素扰动，而是参与图像重绘生成过程。训练时同时优化扩散模型和 watermark decoder，并在 Stage2 引入可微屏摄退化层，让水印在 PIMoG/OLED/LED/Projector 等显示-拍摄退化后仍可被提取。
 
-```
-cover image + watermark bits → diffusion model → watermarked image
-                                  ↓
-                          mixed 屏摄/投影退化层
-                                  ↓
-                          watermark decoder → recovered bits
-```
+整体流程：
 
-扩散模型在载体图像条件和水印条件共同引导下，对载体图像进行内容保持的重绘，
-并在重绘过程中嵌入水印信息。训练和采样阶段均采用 image-to-image 范式，
-始终从 cover image 的加噪版本出发，从不使用纯噪声 N(0,I)。
-
-## 项目结构
-
-```
-guided_diffusion/          # 精简版 guided-diffusion（UNet + 扩散过程）
-dataset/                   # 数据集加载（支持 max_images 限制）
-models/                    # 条件 U-Net、水印解码器
-NOISE_LAYER/               # 统一退化层（PIMoG、OLED、LED、Projector、Mixed）
-configs/                   # YAML 配置文件
-train_watermark_diffusion.py    # 训练脚本
-sample_embed_watermark.py       # 采样/水印嵌入
-eval_watermark_robustness.py    # 鲁棒性评估
+```text
+cover image + watermark bits
+-> watermark-conditioned diffusion model
+-> watermarked image
+-> screen-capture noise layer
+-> watermark decoder
+-> recovered watermark bits
 ```
 
-## 快速开始
+仓库地址：
 
-### 1. 安装环境
+```text
+https://github.com/BossVD/CD-SCR-DiffWatermark
+```
+
+## 代码结构
+
+```text
+.
+|-- train_watermark_diffusion.py       # 主训练脚本，支持 --init_from / --resume
+|-- sample_embed_watermark.py          # 单图水印嵌入、退化验证和可视化输出
+|-- eval_watermark_robustness.py       # 验证集鲁棒性评估
+|-- eval_real_screen.py                # 实拍/外部屏摄图像评估
+|-- models/
+|   |-- watermark_unet.py              # 载体图像 + watermark bits 条件 UNet
+|   `-- watermark_decoder.py           # watermark decoder，默认 residual_multiscale
+|-- dataset/
+|   `-- watermark_image_dataset.py     # 图像读取、水印 bit 生成、裁剪和归一化
+|-- NOISE_LAYER/
+|   |-- build_noise_layer.py           # none/pimog/oled/led/projector/mixed 构建入口
+|   |-- PIMoG_Layer.py                 # LCD/PIMoG 屏摄退化
+|   |-- OLED_Layer.py                  # OLED 屏幕退化
+|   |-- LED_Layer.py                   # LED 大屏点阵退化
+|   `-- Projector_Layer.py             # 投影仪退化
+|-- configs/
+|   |-- watermark_stage1.yaml
+|   |-- watermark_stage2_mixed.yaml
+|   |-- watermark_stage2_amp_pimog_oled.yaml
+|   |-- watermark_stage2_amp_add_led.yaml
+|   |-- watermark_stage2_amp_full_mixed.yaml
+|   `-- watermark_stage2_amp_full_mixed_uniform.yaml
+`-- tools/
+    |-- debug_oled_layer.py            # OLED forward/backward 数值稳定性测试
+    |-- test_noise_layer.py
+    |-- test_led_layer.py
+    `-- visualize_oled_layer.py
+```
+
+## 环境安装
+
+服务器建议使用 conda 环境：
 
 ```bash
 conda create -n wadiff python=3.10 -y
 conda activate wadiff
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
 pip install -r requirements.txt
 ```
 
-### 2. 准备数据
+`requirements.txt` 当前依赖为：
 
-COCO 2017 数据集目录结构：
-
-```
-/path/to/datasets/
-  train2017/
-    000000000009.jpg
-    ...
-  val2017/
-    000000000139.jpg
-    ...
+```text
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.20.0,<3.0.0
+pillow>=9.0.0
+PyYAML>=6.0
+tensorboard>=2.10.0
+kornia>=0.7.0,<0.9.0
 ```
 
----
+本机当前 AGENTS 约定所有 Python 命令使用：
 
-## Stage 1：基础水印嵌入（无屏摄退化）
+```powershell
+D:\Anaconda_envs\envs\wadiff\python.exe train_watermark_diffusion.py --config configs/watermark_stage1.yaml
+```
 
-目的：让模型学会在不加噪声层的情况下嵌入并提取水印。
+下面命令以服务器常用 `PYTHONPATH=. python ...` 写法展示；在本机运行时把 `python` 替换成上面的完整路径。
 
-Stage 1 现在分为 `warmup -> balance -> full` 三个训练阶段。阶段参数统一写在
-`configs/watermark_stage1.yaml` 的 `train.stages` 下，当前生效阶段由
-`train.stage` 指定。
+## 数据集准备
 
-Stage 1 默认启用两条水印注入路径：
+配置文件默认使用 COCO 目录：
 
-- `wm_bits -> wm_emb -> time embedding`：全局水印条件，保留原有路径。
-- `wm_bits -> wm_map -> UNet input`：空间水印条件，先投影为低分辨率 map，再上采样并拼接到 UNet 输入通道。
+```text
+/root/autodl-tmp/datasets/train2017
+/root/autodl-tmp/datasets/val2017
+```
 
-当前 decoder 固定使用默认的 residual multi-scale decoder，输出仍为 raw logits，训练继续使用 `BCEWithLogitsLoss`。
-
-关键观测指标：`bit_acc_clean` 应显著高于 0.5 并逐步达到 0.85+，`loss_wm` 持续下降，`PSNR` 稳定。训练日志会输出 `logits_std`、`sigmoid_mean`、梯度范数、`bit_flip_image_delta` 和 `bit_flip_logit_delta`，用于判断模型是否真的使用 `wm_bits`。
-
-### Stage 1 三阶段训练流程
-
-#### 1. Warmup：先建立水印通信链路
-
-配置文件当前默认就是 warmup：
+对应 YAML 字段：
 
 ```yaml
-train:
-  stage: warmup
+data:
+  train_dir: /root/autodl-tmp/datasets/train2017
+  val_dir: /root/autodl-tmp/datasets/val2017
+  image_size: 128
+  watermark_length: 16
+  watermark_seed: 42
+  train_watermark_mode: random
+  val_watermark_mode: deterministic_random
+  max_train_images: 10000
+  max_val_images: 1000
 ```
 
-启动训练：
+水印长度由 `data.watermark_length` 决定，当前 Stage1/Stage2 默认都是 16 bit。采样时传入的水印不足该长度会补 0，超出会被截断。不要按旧说明固定理解为其他长度。
+
+## 方法要点
+
+`WatermarkConditionedUNet` 使用两条水印条件路径：
+
+- `wm_bits -> watermark_mlp -> time embedding`：把水印作为全局条件注入 UNet time embedding。
+- `wm_bits -> watermark_map_mlp -> spatial map`：生成低分辨率水印 map，上采样后与 `x_t`、`cover_img` 拼接输入 UNet。
+
+默认 decoder 是 `residual_multiscale`，输出 raw logits，训练使用 `BCEWithLogitsLoss`。训练和采样都采用 image-to-image 范式：从 cover image 的加噪版本出发反推 `pred_x0`，不是从纯噪声生成。
+
+## Stage1 Clean Training
+
+Stage1 目标是在 `noise_layer.type: none` 的 clean 条件下训练扩散模型和 decoder，让模型先学会在保持图像质量的同时稳定嵌入和提取水印。
+
+推荐命令：
 
 ```bash
-python train_watermark_diffusion.py --config configs/watermark_stage1.yaml
+PYTHONPATH=. python train_watermark_diffusion.py \
+  --config configs/watermark_stage1.yaml
 ```
 
-warmup 阶段只强调“写水印 + 读水印”，不追求最终图像质量。建议达到以下条件后再切换：
-
-- `train bit_acc > 0.90`
-- `val bit_acc_clean > 0.75`
-- `loss_wm < 0.30` 左右
-- `PSNR` 不要明显崩坏，通常保持在 `25~40` 区间即可
-
-如果只有 train acc 上升、val acc 仍接近 0.5，说明只是记住训练集，不建议进入下一阶段。
-
-#### 2. Balance：恢复图像质量并逐步加入 diffusion 约束
-
-把 `configs/watermark_stage1.yaml` 改为：
+当前 `configs/watermark_stage1.yaml` 要点：
 
 ```yaml
 train:
-  stage: balance
-```
-
-然后用 warmup 的最佳 checkpoint 初始化新阶段：
-
-```bash
-python train_watermark_diffusion.py \
-  --config configs/watermark_stage1.yaml \
-  --init_from checkpoints_stage1/best.pt
-```
-
-注意：阶段切换使用 `--init_from`，不要用 `--resume`。
-
-- `--init_from`：从上一阶段权重初始化一个新阶段，不继承 epoch、global_step、optimizer。
-- `--resume`：同一个阶段中断后继续训练，会恢复 epoch、global_step、optimizer 和随机状态。
-
-balance 阶段的 loss 会按 step 从 YAML 中自动读取：
-
-```yaml
-train:
-  stages:
-    balance:
-      loss_schedule:
-        - until_step: 3000
-          lambda_diff: 0.0
-          lambda_img: 0.1
-          lambda_wm: 20.0
-          lambda_delta: 0.0
-        - until_step: 8000
-          lambda_diff: 0.0
-          lambda_img: 0.5
-          lambda_wm: 12.0
-          lambda_delta: 0.0
-        - until_step: -1
-          lambda_diff: 0.1
-          lambda_img: 1.0
-          lambda_wm: 8.0
-          lambda_delta: 0.0
-```
-
-#### 3. Full：最终 Stage 1 收敛
-
-如果 balance 阶段的水印准确率稳定、图像质量也恢复，再切到 full：
-
-```yaml
-train:
-  stage: full
-```
-
-继续从 balance 的最佳 checkpoint 初始化：
-
-```bash
-python train_watermark_diffusion.py \
-  --config configs/watermark_stage1.yaml \
-  --init_from checkpoints_stage1/best.pt
-```
-
-full 阶段参数同样来自 YAML：
-
-```yaml
-train:
-  stages:
-    full:
-      lambda_diff: 0.3
-      lambda_img: 1.5
-      lambda_wm: 6.0
-      lambda_delta: 0.01
-```
-
-### 中断后恢复当前阶段
-
-如果只是当前阶段训练中断，不切换阶段，使用：
-
-```bash
-python train_watermark_diffusion.py \
-  --config configs/watermark_stage1.yaml \
-  --resume checkpoints_stage1/latest.pt
-```
-
-### Stage 1 配置要点
-
-对应配置文件：`configs/watermark_stage1.yaml`
-
-```yaml
-model:
-  use_watermark_time_emb: true
-  use_watermark_spatial_map: true
-  wm_map_channels: 4
-  wm_map_size: 16
-  wm_time_scale: 1.0
-  wm_map_scale: 1.0
-noise_layer:
-  type: none             # 关闭所有退化层
-train:
-  stage: warmup
   lr: 0.0001
-  lambda_wm: 20.0
   epochs: 50
+  batch_size: 32
+  use_amp: true
+  stage: warmup
+  lambda_diff: 0.0
+  lambda_img: 0.1
+  lambda_wm: 20.0
+  save_interval: 1
+  sample_interval: 5000
   log_interval: 100
   debug_interval: 500
-  use_loss_schedule: false
-  stages:
-    warmup:
-      lambda_diff: 0.0
-      lambda_img: 0.1
-      lambda_wm: 20.0
-      lambda_delta: 0.0
-decoder:
-  type: residual_multiscale
-  base_channels: 32
-  hidden_dim: 512
-  dropout: 0.1
-  norm_groups: 8
-  use_multiscale: true
-diffusion:
-  wm_t_min: 0
-  wm_t_max: 20
-  train_t_start: 200
+
+noise_layer:
+  type: none
+
 output:
   checkpoint_dir: ./checkpoints_stage1
   sample_dir: ./outputs_stage1/samples
   log_dir: ./outputs_stage1/logs
 ```
 
-启用 `wm_map_channels=4` 后，UNet 输入通道从 `x_t + cover_img = 6` 变为 `x_t + cover_img + wm_map = 10`，输出仍为 3 通道噪声预测。
+Stage1 checkpoint：
 
-Shape smoke test:
-
-```bash
-python tools/test_wm_map_forward.py
+```text
+checkpoints_stage1/latest.pt   # 按 save_interval 保存
+checkpoints_stage1/best.pt     # 按 bit_acc_clean 选择
+checkpoints_stage1/final.pt    # 训练结束保存
 ```
 
----
+同一阶段中断后继续：
 
-## Stage 2：屏摄鲁棒性微调（Mixed 混合噪声层）
+```bash
+PYTHONPATH=. python train_watermark_diffusion.py \
+  --config configs/watermark_stage1.yaml \
+  --resume checkpoints_stage1/latest.pt
+```
 
-Stage 2 从 Stage 1 的 checkpoint 继续训练，在水印提取路径上加入混合退化层，提升水印经过屏摄、投影、显示面板等退化后的提取准确率。
+## Stage2 Mixed Robust Training
 
-| 噪声层 | 模拟效果 |
-|--------|----------|
-| PIMoG | 透视、光照、摩尔纹、高斯噪声，模拟经典屏摄退化 |
-| OLED | OLED 色调响应、子像素、屏幕扩散、相机模糊、频闪条纹、反射等 |
-| LED | LED 低分辨率显示、灯珠/子像素结构、moire、scanline、相机退化等 |
-| Projector | 投影 gamma、亮度衰减、热点、纹理、透视、环境光、颜色偏移等 |
+Stage2 在稳定 Stage1 checkpoint 基础上引入屏摄退化模拟层，训练水印在不同显示/拍摄退化下仍可提取。当前支持的 `noise_layer.type`：
 
-默认 mixed 采样概率为：
+```text
+none
+pimog
+oled
+led
+projector
+mixed
+```
+
+推荐不要从出现过 NaN、黑图、`PSNR=nan`、`loss=nan` 或大量 skipped step 的 Stage2 checkpoint 继续 `--resume`。这类 checkpoint 可能已经保存了污染的 optimizer/scaler 状态。应重新从稳定的 Stage1 checkpoint 初始化：
+
+```bash
+PYTHONPATH=. python train_watermark_diffusion.py \
+  --config configs/watermark_stage2_mixed.yaml \
+  --init_from checkpoints_stage1/final.pt
+```
+
+`--init_from` 与 `--resume` 的区别：
+
+- `--init_from`：用于从已有 checkpoint 初始化新阶段，只加载 diffusion model 和 decoder 权重，不继承 optimizer、scaler、epoch、global_step。
+- `--resume`：用于严格续训同一阶段，会继承 optimizer、scaler、epoch、global_step 和随机状态。
+
+当前 `configs/watermark_stage2_mixed.yaml` 是保守 curriculum 起点，只混合 PIMoG 和 OLED：
 
 ```yaml
+train:
+  lr: 0.00002
+  epochs: 60
+  use_amp: true
+  max_grad_norm: 1.0
+  skip_nonfinite: true
+  amp_init_scale: 256
+  amp_growth_interval: 1000
+
 noise_layer:
   type: mixed
   mixed:
-    candidates: [pimog, oled, led, projector]
-    probs: [0.25, 0.25, 0.25, 0.25]
-```
-
-### Stage 2 训练命令
-
-```bash
-python train_watermark_diffusion.py \
-  --config configs/watermark_stage2_mixed.yaml \
-  --init_from checkpoints_stage1/best.pt
-```
-
-`--init_from` 用于从上一阶段 checkpoint 初始化一个新训练阶段，例如 Stage1 到 Stage2；它只加载 diffusion model 和 decoder 权重，不继承 epoch、global_step 或 optimizer 状态。
-
-`--resume` 用于同一训练阶段中断后的继续训练；它会恢复模型、decoder、optimizer、epoch、global_step 和随机状态。
-
-### Stage 2 配置要点
-
-对应配置文件：`configs/watermark_stage2_mixed.yaml`
-
-```yaml
-noise_layer:
-  type: mixed             # 从 pimog / oled / led / projector 中按概率采样
-
-train:
-  lr: 0.00005           # 微调用更低学习率
-  lambda_img: 1.5        # 增强图像保真约束
-  lambda_wm: 5.0         # Stage 2 初始值更稳，后续可按 bit_acc 调高
-  epochs: 50
-  reset_decoder: false   # 旧 decoder checkpoint 不兼容时可手动改为 true
-
-decoder:
-  type: residual_multiscale
-  base_channels: 32
-  hidden_dim: 512
-  dropout: 0.1
-  norm_groups: 8
-  use_multiscale: true
+    candidates: [pimog, oled]
+    probs: [0.70, 0.30]
 
 output:
   checkpoint_dir: ./checkpoints_stage2_mixed
-  sample_dir: ./outputs_stage2_mixed/samples
-  log_dir: ./outputs_stage2_mixed/logs
 ```
 
-### 中断后恢复训练
+Stage2 checkpoint：
 
-```bash
-python train_watermark_diffusion.py \
-  --config configs/watermark_stage2_mixed.yaml \
-  --resume checkpoints_stage2_mixed/latest.pt
+```text
+checkpoints_stage2_mixed/latest.pt
+checkpoints_stage2_mixed/best.pt     # 开启噪声层时按 bit_acc_degraded 选择
+checkpoints_stage2_mixed/final.pt
 ```
 
-### Stage 2 从 Stage 1 初始化
+## Stage2 AMP Curriculum 配置
 
-```bash
-python train_watermark_diffusion.py \
-  --config configs/watermark_stage2_mixed.yaml \
-  --init_from checkpoints_stage1/best.pt
+仓库已提供四个 Stage2 AMP 配置，用于逐步扩大 mixed 噪声分布：
+
+```text
+configs/watermark_stage2_amp_pimog_oled.yaml
+  candidates: [pimog, oled]
+  probs: [0.70, 0.30]
+  output.checkpoint_dir: ./checkpoints_stage2_amp_pimog_oled
+
+configs/watermark_stage2_amp_add_led.yaml
+  candidates: [pimog, oled, led]
+  probs: [0.50, 0.30, 0.20]
+  output.checkpoint_dir: ./checkpoints_stage2_amp_add_led
+
+configs/watermark_stage2_amp_full_mixed.yaml
+  candidates: [pimog, oled, led, projector]
+  probs: [0.35, 0.30, 0.20, 0.15]
+  output.checkpoint_dir: ./checkpoints_stage2_amp_full_mixed
+
+configs/watermark_stage2_amp_full_mixed_uniform.yaml
+  candidates: [pimog, oled, led, projector]
+  probs: [0.25, 0.25, 0.25, 0.25]
+  output.checkpoint_dir: ./checkpoints_stage2_amp_full_mixed_uniform
 ```
 
----
-
-## 采样（生成带水印图）
+建议训练顺序：
 
 ```bash
-# 基础采样（随机水印）
-python sample_embed_watermark.py \
-  --checkpoint checkpoints_stage2_mixed/best.pt \
-  --input ./test_images/cover.png \
-  --output ./outputs_stage2_mixed/watermarked.png \
-  --t_start 200
+PYTHONPATH=. python train_watermark_diffusion.py \
+  --config configs/watermark_stage2_amp_pimog_oled.yaml \
+  --init_from checkpoints_stage1/final.pt
 
-# 指定水印内容
-python sample_embed_watermark.py \
-  --checkpoint checkpoints_stage2_mixed/best.pt \
-  --input ./test_images/cover.png \
-  --watermark "1010101011001010" \
-  --output ./outputs_stage2_mixed/watermarked.png \
-  --t_start 200
+PYTHONPATH=. python train_watermark_diffusion.py \
+  --config configs/watermark_stage2_amp_add_led.yaml \
+  --init_from checkpoints_stage2_amp_pimog_oled/best.pt
 
-# 同时保存固定退化版本，便于区分 mixed 训练后的不同屏摄退化
-python sample_embed_watermark.py \
+PYTHONPATH=. python train_watermark_diffusion.py \
+  --config configs/watermark_stage2_amp_full_mixed.yaml \
+  --init_from checkpoints_stage2_amp_add_led/best.pt
+```
+
+四类均匀 mixed 可作为稳定后的压力测试，不建议作为 Stage2 初期默认起点：
+
+```bash
+PYTHONPATH=. python train_watermark_diffusion.py \
+  --config configs/watermark_stage2_amp_full_mixed_uniform.yaml \
+  --init_from checkpoints_stage2_amp_full_mixed/best.pt
+```
+
+## AMP 与数值稳定保护
+
+Stage2 支持 AMP，但不是整条链路都使用 FP16。当前训练策略是：
+
+- UNet forward 使用 AMP autocast 加速。
+- `predict_start_from_noise`、`noise_layer`、decoder 和 watermark loss 在 FP32 中执行。
+
+原因是 OLED/LED/Projector 等退化层包含 `grid_sample`、`pow`、`sqrt`、blur、`interpolate` 等操作，半精度反向传播更容易产生不稳定梯度。因此正式 Stage2 中只对 UNet 主干使用 AMP，退化层和水印损失链路保持 FP32。
+
+关键配置：
+
+```yaml
+train:
+  use_amp: true
+  amp_init_scale: 256
+  amp_growth_interval: 1000
+  max_grad_norm: 1.0
+  skip_nonfinite: true
+```
+
+当前训练代码包含以下保护：
+
+- 检查 non-finite `loss_diff`、`loss_img`、`loss_wm`、`watermark_objective` 等 loss。
+- 检查退化层输出 `attacked_01` 是否包含 NaN/Inf。
+- 检查所有可训练参数的梯度是否 finite。
+- 异常 step 自动跳过，不执行 `optimizer.step()`。
+- 被跳过的 step 不推进 `global_step`。
+- 验证指标 non-finite 时跳过该 epoch 的 checkpoint 保存。
+- AMP 模式下先 `scaler.unscale_(optimizer)`，再检查/裁剪梯度。
+- 使用 `clip_grad_norm_` 和 `max_grad_norm` 控制梯度范数。
+- 日志输出 active `noise_layer`、`grad_norm`、`skipped_steps`。
+
+示例日志：
+
+```text
+[E002|B000500|S000500] L=0.0480 ... noise_layer=mixed:oled grad_norm=1.018 skipped_steps=0
+```
+
+含义：
+
+- `B`：已处理的 batch step。
+- `S`：成功执行 optimizer step 的 `global_step`。
+- `skipped_steps`：由于 non-finite loss/grad/退化输出被跳过的 step 数。
+
+## Noise Layer 说明
+
+四类显示设备/退化层对应关系：
+
+```text
+PIMoG / LCD: 普通显示器或 LCD 屏摄退化。
+OLED: 手机等 OLED 屏幕的 tone、子像素、相机模糊、banding、view color shift 等退化。
+LED: 大屏 LED 点阵、灯珠结构、moire、scanline、bloom 等退化。
+Projector: 投影仪反射式投影/拍摄退化，包括 gamma、falloff、hotspot、纹理、环境光等。
+```
+
+`mixed` 每个 forward 为整个 batch 抽取一个候选层，并通过 `get_last_name()` 记录实际选中的层，训练日志会显示为 `mixed:oled`、`mixed:pimog` 等。
+
+## OLED 稳定性修复与 Debug
+
+`OLED_Layer` 已针对 Stage2 可微训练做数值稳定处理，重点修复 sensor noise 中 `sqrt(0)` 附近可能导致梯度爆炸的问题。相关配置包括：
+
+```yaml
+noise_layer:
+  oled:
+    train_safe: true
+    debug_finite: false
+    sensor_noise_eps: 0.0001
+    final_nan_to_num: true
+```
+
+独立测试命令：
+
+```bash
+PYTHONPATH=. python tools/debug_oled_layer.py
+```
+
+正常输出应类似：
+
+```text
+--- train_safe_noise_off ---
+output finite=True nan=0 inf=0
+input_grad finite=True nan=0 inf=0
+--- train_safe_noise_on ---
+output finite=True nan=0 inf=0
+input_grad finite=True nan=0 inf=0
+OLED debug completed without non-finite values.
+```
+
+如果脚本出现 `FloatingPointError`，或 `output/input_grad` 中有 `nan/inf`，说明 OLED 噪声层仍存在数值稳定问题，应先修复噪声层，不要直接进入 Stage2 mixed 训练。
+
+## 采样命令
+
+单图嵌入水印：
+
+```bash
+PYTHONPATH=. python sample_embed_watermark.py \
+  --checkpoint checkpoints_stage2_mixed/best.pt \
   --config configs/watermark_stage2_mixed.yaml \
+  --input path/to/cover.png \
+  --watermark 1010101010101010 \
+  --output outputs/sample.png \
+  --t_start 300
+```
+
+同时保存退化图和对比图：
+
+```bash
+PYTHONPATH=. python sample_embed_watermark.py \
   --checkpoint checkpoints_stage2_mixed/best.pt \
-  --input ./test_images/cover.png \
-  --output ./outputs_stage2_mixed/watermarked.png \
-  --t_start 200 \
+  --config configs/watermark_stage2_mixed.yaml \
+  --input path/to/cover.png \
+  --watermark 1010101010101010 \
+  --output outputs/sample.png \
   --noise_layer mixed \
   --save_degraded \
   --degradation_types pimog,oled,led,projector
 ```
 
-水印位数不足 64 位会自动补 0，超出会被截断。
-采样会输出 `bit_acc_clean` 和 `bit_acc_degraded`。传入 `--save_degraded` 时，会把退化图、cover/watermarked/degraded/residual grid，以及固定退化版本保存到输出目录下的 `degraded/` 子目录。
+采样脚本会输出：
 
----
+- `bit_acc_clean`
+- `bit_acc_degraded`
+- clean/degraded recovered bits
+- 水印图 `--output`
+- `comparison/<name>_comparison.png`
+- 使用 `--save_degraded` 时额外保存 `degraded/<name>_grid.png` 和各退化图
 
-## 测试噪声层
+## 鲁棒性评估
 
-```powershell
-D:\Anaconda_envs\envs\wadiff\python.exe tools\test_noise_layer.py `
-  --input "D:\1_Pytorch_Project\WaDiff\tools\test.jpg" `
-  --config configs\watermark_stage1.yaml `
-  --image_size 256 `
-  --device cuda
-```
-
----
-
-## 屏摄鲁棒性评估
+验证集评估：
 
 ```bash
-python eval_watermark_robustness.py \
+PYTHONPATH=. python eval_watermark_robustness.py \
   --checkpoint checkpoints_stage2_mixed/best.pt \
   --config configs/watermark_stage2_mixed.yaml \
   --noise_layers clean,pimog,oled,led,projector,mixed \
   --output ./outputs_stage2_mixed/eval_results.csv
 ```
 
-评估脚本默认评估 `clean,pimog,oled,led,projector,mixed`，并输出每种退化下的 `bit_acc`、`BER` 和 `PSNR`。如果不传 `--data_dir`，会使用配置文件中的 `data.val_dir`。
+常用参数：
 
----
+```text
+--data_dir      不传时使用 config.data.val_dir
+--batch_size    默认 4
+--t_start       默认 300
+--device        默认 cuda
+--seed          不传时使用 checkpoint/config 中的 seed
+```
 
-## 训练模式切换
+输出包括：
 
-| 模式 | max_train_images | epochs | image_size | 用途 |
-|------|:---:|:---:|:---:|------|
-| 快速调试 | 10000 | 10 | 64 | 验证流程跑通 |
-| 全量训练 | null | 20~50 | 128 | 正式训练 |
+- 汇总 CSV：`bit_acc_<layer>`、`ber_<layer>`、`psnr_<layer>`
+- 逐图 CSV：`*_per_image.csv`
+- 示例图：`eval_samples/`
 
-只需改 YAML，不需要改代码。
+## 日志指标解释
 
-## 关键设计
+训练日志字段：
 
-- **保持图像比例**：训练集将短边缩放到目标尺寸后随机裁剪；验证、采样和实拍评估使用中心裁剪，不把原图强制拉伸成正方形
-- **确定性水印**：验证集根据相对路径和 `data.watermark_seed` 固定水印；训练集按图片和 epoch 可复现地变化，避免模型记忆“图片→水印”映射
-- **实验随机种子**：`train.seed` 统一控制 Python、NumPy、PyTorch 和 DataLoader，检查点同时保存随机状态以支持可复现恢复
-- **显存控制**：`use_amp: true` 启用真实 autocast；扩散分支先反向并释放计算图，再运行水印分支，避免同时保留两套 U-Net 激活
-- **最佳模型指标**：关闭噪声层时 `best.pt` 按 `bit_acc_clean` 保存；开启任意噪声层时按 `bit_acc_degraded` 保存，并在每个验证 epoch 后判断
-- **梯度流**：`loss_wm` 通过整个计算图反传（无 `.detach()`），同时优化 diffusion_model + decoder
-- **水印解码器**：默认使用 residual multi-scale decoder；如需消融旧版 CNN baseline，可在 YAML 中设置 `decoder.type: simple`
-- **t_diff / t_wm 分离**：噪声预测用全时间步，水印损失用小时间步保证 pred_x0 稳定
-- **图像范围**：扩散模型和 decoder 使用 `[-1,1]`；统一退化层输入输出使用 `[0,1]`，训练接入点负责转换
-- **image-to-image**：训练和采样始终从 cover 加噪出发，非纯噪声生成
-- **统一退化配置**：仅通过 `noise_layer.type` 选择退化层，支持 `none`、`pimog`、`oled`、`led`、`projector` 和 `mixed`
+```text
+L: 总损失
+diff: 扩散噪声预测损失
+img: 图像重建 L1 损失
+wm: 水印提取 BCEWithLogits 损失
+delta: 水印图与原图的平均残差
+tv: 残差 total variation 正则
+topk: 局部大残差惩罚
+ch: 通道平衡损失
+lambda: 当前 diff/img/wm 权重
+lambda_delta: 当前 residual mean 权重
+lambda_visual: 当前 tv/topk/channel 权重
+bit_acc: 当前 batch 水印 bit 准确率
+PSNR: 图像质量
+logits_std: decoder 输出 logits 标准差
+sigmoid_mean: decoder 输出 sigmoid 后均值
+noise_layer: 当前 batch 使用的噪声层
+grad_norm: 梯度裁剪前返回的梯度范数
+skipped_steps: 因 NaN/Inf 被跳过的 step 数
+```
 
-## 参考文献
+如果出现 `loss=nan`、`PSNR=nan`、sample 黑图或 `skipped_steps` 快速增加，应立即停止训练，检查最近日志中的 `noise_layer`，并优先运行对应噪声层 debug。
 
-- WaDiff (ECCV 2024): [A Watermark-Conditioned Diffusion Model for IP Protection](https://arxiv.org/abs/2403.10893)
-- PIMoG (MM 2022): [An Effective Screen-shooting Noise-Layer Simulation for Deep-Learning-Based Watermarking Network](https://doi.org/10.1145/3503161.3548049)
+## Checkpoint 使用规则
+
+- Stage1 `best.pt` 按 `bit_acc_clean` 保存。
+- Stage2 或任意启用噪声层的训练，`best.pt` 按 `bit_acc_degraded` 保存。
+- 阶段切换使用 `--init_from`。
+- 同一阶段断点续训才使用 `--resume`。
+- 不要从已经出现 NaN/Inf、黑图或大量 skipped step 的 Stage2 checkpoint resume。
+- 修改 `data.watermark_length`、UNet 水印 map 设置或 decoder 架构后，旧 checkpoint 可能只能部分加载，正式训练前应重新确认日志中的 load/mismatch 信息。
+
+## FAQ
+
+### 1. 为什么 Stage2 比 Stage1 慢？
+
+Stage2 多了可微屏摄退化层，例如 `grid_sample`、blur、`interpolate`、gamma、moire、noise 等操作，而且这些操作还要参与反向传播，所以比 clean training 慢。
+
+### 2. 为什么不建议 Stage2 初期直接四类均匀 mixed？
+
+可以直接四类一起训练，但不建议初期就均匀混合。LED 和 Projector 是更强退化层，容易造成梯度冲击。推荐先用 PIMoG+OLED，稳定后加入 mild LED，最后加入 Projector；四类均匀 mixed 更适合稳定后的压力测试。
+
+### 3. Stage2 出现 NaN 怎么办？
+
+停止训练；不要 resume 已污染的 Stage2 checkpoint；检查日志中最近的 `noise_layer`；确认 `skip_nonfinite: true` 和 `max_grad_norm` 已开启；从稳定 Stage1 checkpoint 重新 `--init_from`；必要时先单独运行对应噪声层 debug。
+
+### 4. 为什么 AMP 不覆盖整个 Stage2？
+
+噪声层中的 `pow`、`sqrt`、`grid_sample`、blur 等操作在半精度下更容易产生不稳定梯度。当前策略是 UNet 使用 AMP 加速，退化层和 decoder/loss 链路保持 FP32。
+
+### 5. OLED debug 脚本有什么用？
+
+用于独立测试 `OLED_Layer` 的 forward/backward 是否产生 NaN/Inf。进入 Stage2 mixed 前建议先运行，尤其是在修改 OLED 参数或升级 PyTorch 后。
+
+## 需要重点核对的配置项
+
+正式训练前建议核对：
+
+```text
+data.train_dir / data.val_dir
+data.watermark_length
+train.batch_size
+train.lr
+train.use_amp
+train.max_grad_norm
+train.skip_nonfinite
+noise_layer.type
+noise_layer.mixed.candidates
+noise_layer.mixed.probs
+noise_layer.oled.train_safe
+noise_layer.oled.sensor_noise_eps
+output.checkpoint_dir
+output.sample_dir
+output.log_dir
+```
+
+## 参考
+
+- WaDiff (ECCV 2024): A Watermark-Conditioned Diffusion Model for IP Protection
+- PIMoG (MM 2022): An Effective Screen-shooting Noise-Layer Simulation for Deep-Learning-Based Watermarking Network

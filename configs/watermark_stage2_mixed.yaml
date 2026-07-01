@@ -42,7 +42,7 @@ train:
   deterministic: true
   batch_size: 16
   num_workers: 8
-  lr: 0.00003
+  lr: 0.00005
   epochs: 60
   device: cuda
   use_amp: true
@@ -89,7 +89,7 @@ train:
           lambda_channel: 0.08
 
   save_interval: 1
-  sample_interval: 5000
+  sample_interval: 1000
   log_interval: 100
   debug_interval: 500
   reset_decoder: false
@@ -206,7 +206,7 @@ noise_layer:
 
   mixed:
     candidates: [pimog, oled, led, projector]
-    probs: [0.25, 0.20, 0.20, 0.25]
+    probs: [0.25, 0.25, 0.25, 0.25]
 
 output:
   checkpoint_dir: ./checkpoints_stage2_mixed

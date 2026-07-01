@@ -165,13 +165,25 @@ def first_nonfinite_tensor(named_tensors):
     return None
 
 
-def gradients_are_finite(parameters):
-    """Check all existing gradients for trainable parameters."""
-    for index, param in enumerate(parameters):
+def gradients_are_finite(named_parameters):
+    """Check all existing gradients for trainable named parameters."""
+    for name, param in named_parameters:
         if not param.requires_grad or param.grad is None:
             continue
-        if not torch.isfinite(param.grad.detach()).all().item():
-            return False, f'grad_{index}_nonfinite'
+        grad = param.grad.detach()
+        finite = torch.isfinite(grad)
+        if not finite.all().item():
+            nan_count = torch.isnan(grad).sum().item()
+            inf_count = torch.isinf(grad).sum().item()
+            finite_abs = grad[finite].abs()
+            grad_abs_max = (
+                finite_abs.max().item() if finite_abs.numel() > 0 else float('nan')
+            )
+            reason = (
+                f'grad_nonfinite:{name}:nan_count={nan_count}:'
+                f'inf_count={inf_count}:grad_abs_max={grad_abs_max:.6g}'
+            )
+            return False, reason
     return True, None
 
 
@@ -703,8 +715,24 @@ def train(config):
     # --- AMP ---
     use_amp = cfg['train'].get('use_amp', False)
     amp_enabled = use_amp and device.type == 'cuda'
-    scaler = torch.amp.GradScaler('cuda') if amp_enabled else None
-    print(f"[Train] AMP autocast: {'enabled' if amp_enabled else 'disabled'}")
+    scaler = (
+        torch.amp.GradScaler(
+            'cuda',
+            init_scale=float(cfg['train'].get('amp_init_scale', 256)),
+            growth_interval=int(cfg['train'].get('amp_growth_interval', 1000)),
+        )
+        if amp_enabled
+        else None
+    )
+    print(
+        f"[Train] AMP autocast: {'enabled' if amp_enabled else 'disabled'} "
+        f"init_scale={cfg['train'].get('amp_init_scale', 256)} "
+        f"growth_interval={cfg['train'].get('amp_growth_interval', 1000)}"
+    )
+    detect_anomaly = bool(cfg['train'].get('detect_anomaly', False))
+    torch.autograd.set_detect_anomaly(detect_anomaly)
+    if detect_anomaly:
+        print("[Train] torch.autograd anomaly detection enabled")
 
     # --- Checkpoint loading ---
     resume_path = cfg.get('_resume_path', None)
@@ -741,9 +769,12 @@ def train(config):
     debug_interval = cfg['train'].get('debug_interval', log_interval * 5)
     max_grad_norm = float(cfg['train'].get('max_grad_norm', 1.0))
     skip_nonfinite = bool(cfg['train'].get('skip_nonfinite', True))
-    trainable_parameters = [
-        param for group in optimizer.param_groups for param in group['params']
+    named_trainable_parameters = [
+        (f'model.{name}', param) for name, param in model.named_parameters()
+    ] + [
+        (f'decoder.{name}', param) for name, param in decoder.named_parameters()
     ]
+    trainable_parameters = [param for _, param in named_trainable_parameters]
     # --- CSV loggers ---
     train_log_path = os.path.join(log_dir, 'train_log.csv')
     val_log_path = os.path.join(log_dir, 'val_log.csv')
@@ -752,7 +783,8 @@ def train(config):
     csv_mode = 'a' if resume_path else 'w'
     train_csv = open(train_log_path, csv_mode, newline='')
     train_writer = csv.DictWriter(train_csv, fieldnames=[
-        'epoch', 'global_step', 'loss_total', 'loss_diff', 'loss_img', 'loss_wm',
+        'epoch', 'batch_step', 'global_step',
+        'loss_total', 'loss_diff', 'loss_img', 'loss_wm',
         'loss_delta', 'loss_tv', 'loss_topk', 'loss_channel',
         'bit_acc', 'psnr', 'logits_std', 'sigmoid_mean',
         'bit_flip_image_delta', 'bit_flip_logit_delta', 'lr', 'noise_layer_type',
@@ -785,15 +817,17 @@ def train(config):
         sample_writer.writeheader()
 
     skipped_steps = 0
+    batch_step = 0
 
-    def log_skipped_step(epoch, step, active_noise_type, reason,
+    def log_skipped_step(epoch, batch_step, global_step, active_noise_type, reason,
                          grad_norm_clipped=float('nan')):
         nonlocal skipped_steps
         skipped_steps += 1
         optimizer.zero_grad(set_to_none=True)
         train_writer.writerow({
             'epoch': epoch,
-            'global_step': step,
+            'batch_step': batch_step,
+            'global_step': global_step,
             'loss_total': float('nan'),
             'loss_diff': float('nan'),
             'loss_img': float('nan'),
@@ -816,7 +850,8 @@ def train(config):
         })
         train_csv.flush()
         print(
-            f"[Skip NonFinite] step={step} noise_layer={active_noise_type} "
+            f"[Skip NonFinite] batch_step={batch_step} global_step={global_step} "
+            f"noise_layer={active_noise_type} "
             f"reason={reason} skipped_steps={skipped_steps} "
             f"grad_norm={grad_norm_clipped}"
         )
@@ -851,6 +886,7 @@ def train(config):
         noise_layer.train()
 
         for batch in train_loader:
+            batch_step += 1
             cover_img = batch['image'].to(device)    # [B, 3, H, W], [-1, 1]
             B = cover_img.size(0)
             wm_bits = generate_train_watermark(B, watermark_length, device)
@@ -898,11 +934,11 @@ def train(config):
                 if nonfinite_name is not None:
                     log_skipped_step(
                         epoch,
+                        batch_step,
                         global_step,
                         active_noise_type,
                         f'{nonfinite_name}_nan',
                     )
-                    global_step += 1
                     continue
 
             if lambda_diff > 0:
@@ -931,17 +967,25 @@ def train(config):
                     wm_bits=wm_bits,
                 )
 
+            attacked_nonfinite = False
+            with torch.amp.autocast(device_type=device.type, enabled=False):
                 # KEY: NO .detach() — loss_wm backpropagates through the U-Net.
-                pred_x0 = predict_start_from_noise(diffusion, x_t_wm, t_wm, pred_noise_wm)
+                pred_x0 = predict_start_from_noise(
+                    diffusion,
+                    x_t_wm.float(),
+                    t_wm,
+                    pred_noise_wm.float(),
+                )
                 pred_x0 = pred_x0.clamp(-1, 1)
+                cover_img_fp32 = cover_img.float()
 
                 # Image fidelity loss in [-1, 1]
-                loss_img = F.l1_loss(pred_x0, cover_img)
-                loss_delta = (pred_x0 - cover_img).abs().mean()
+                loss_img = F.l1_loss(pred_x0, cover_img_fp32)
+                loss_delta = (pred_x0 - cover_img_fp32).abs().mean()
 
                 # Unified degradation layers use [0, 1].
-                pred_x0_01 = (pred_x0 + 1.0) / 2.0
-                cover_01_for_loss = (cover_img + 1.0) / 2.0
+                pred_x0_01 = ((pred_x0 + 1.0) / 2.0).clamp(1e-6, 1.0 - 1e-6)
+                cover_01_for_loss = (cover_img_fp32 + 1.0) / 2.0
                 residual_01 = pred_x0_01 - cover_01_for_loss
                 loss_tv = residual_tv_loss(residual_01)
                 loss_topk = residual_topk_loss(
@@ -953,6 +997,13 @@ def train(config):
                 attacked_01 = noise_layer(pred_x0_01).float()
                 if noise_type == 'mixed':
                     active_noise_type = f"mixed:{noise_layer.get_last_name()}"
+                attacked_nonfinite = not tensor_is_finite(attacked_01)
+                attacked_01 = torch.nan_to_num(
+                    attacked_01,
+                    nan=0.5,
+                    posinf=1.0,
+                    neginf=0.0,
+                ).clamp(0.0, 1.0)
                 decoder_input = attacked_01.mul(2.0).sub(1.0)
 
                 pred_logits = decoder(decoder_input)
@@ -963,17 +1014,26 @@ def train(config):
                 logits_std = pred_logits.detach().std().item()
                 sigmoid_mean = torch.sigmoid(pred_logits.detach()).mean().item()
 
-            # ========================================================
-            # 3. Total loss
-            # ========================================================
-            watermark_objective = (
-                lambda_img * loss_img
-                + lambda_wm * loss_wm
-                + lambda_delta * loss_delta
-                + lambda_tv * loss_tv
-                + lambda_topk * loss_topk
-                + lambda_channel * loss_channel
-            )
+                # ========================================================
+                # 3. Total loss
+                # ========================================================
+                watermark_objective = (
+                    lambda_img * loss_img
+                    + lambda_wm * loss_wm
+                    + lambda_delta * loss_delta
+                    + lambda_tv * loss_tv
+                    + lambda_topk * loss_topk
+                    + lambda_channel * loss_channel
+                )
+            if skip_nonfinite and attacked_nonfinite:
+                log_skipped_step(
+                    epoch,
+                    batch_step,
+                    global_step,
+                    active_noise_type,
+                    'attacked_01_nonfinite',
+                )
+                continue
             if skip_nonfinite:
                 nonfinite_name = first_nonfinite_tensor([
                     ('loss_img', loss_img),
@@ -987,11 +1047,11 @@ def train(config):
                 if nonfinite_name is not None:
                     log_skipped_step(
                         epoch,
+                        batch_step,
                         global_step,
                         active_noise_type,
                         f'{nonfinite_name}_nan',
                     )
-                    global_step += 1
                     continue
 
             # ========================================================
@@ -1009,16 +1069,18 @@ def train(config):
                     if hasattr(model, 'watermark_map_mlp')
                     else float('nan')
                 )
-                grads_finite, grad_reason = gradients_are_finite(trainable_parameters)
+                grads_finite, grad_reason = gradients_are_finite(
+                    named_trainable_parameters
+                )
                 if skip_nonfinite and not grads_finite:
                     scaler.update()
                     log_skipped_step(
                         epoch,
+                        batch_step,
                         global_step,
                         active_noise_type,
                         grad_reason,
                     )
-                    global_step += 1
                     continue
                 grad_norm_clipped = torch.nn.utils.clip_grad_norm_(
                     trainable_parameters,
@@ -1029,12 +1091,12 @@ def train(config):
                     scaler.update()
                     log_skipped_step(
                         epoch,
+                        batch_step,
                         global_step,
                         active_noise_type,
                         'clip_grad_norm_nonfinite',
                         grad_norm_clipped,
                     )
-                    global_step += 1
                     continue
                 scaler.step(optimizer)
                 scaler.update()
@@ -1048,15 +1110,17 @@ def train(config):
                     if hasattr(model, 'watermark_map_mlp')
                     else float('nan')
                 )
-                grads_finite, grad_reason = gradients_are_finite(trainable_parameters)
+                grads_finite, grad_reason = gradients_are_finite(
+                    named_trainable_parameters
+                )
                 if skip_nonfinite and not grads_finite:
                     log_skipped_step(
                         epoch,
+                        batch_step,
                         global_step,
                         active_noise_type,
                         grad_reason,
                     )
-                    global_step += 1
                     continue
                 grad_norm_clipped = torch.nn.utils.clip_grad_norm_(
                     trainable_parameters,
@@ -1066,14 +1130,16 @@ def train(config):
                 if skip_nonfinite and not math.isfinite(grad_norm_clipped):
                     log_skipped_step(
                         epoch,
+                        batch_step,
                         global_step,
                         active_noise_type,
                         'clip_grad_norm_nonfinite',
                         grad_norm_clipped,
                     )
-                    global_step += 1
                     continue
                 optimizer.step()
+
+            global_step += 1
 
             loss_total = (
                 lambda_diff * loss_diff
@@ -1101,6 +1167,7 @@ def train(config):
             if global_step % log_interval == 0:
                 log_data = {
                     'epoch': epoch,
+                    'batch_step': batch_step,
                     'global_step': global_step,
                     'loss_total': loss_total.item(),
                     'loss_diff': loss_diff.item(),
@@ -1172,7 +1239,7 @@ def train(config):
                 train_csv.flush()
 
                 print(
-                    f"[E{epoch:03d}|S{global_step:06d}] "
+                    f"[E{epoch:03d}|B{batch_step:06d}|S{global_step:06d}] "
                     f"L={loss_total.item():.4f} "
                     f"(diff={loss_diff.item():.4f} img={loss_img.item():.4f} "
                     f"wm={loss_wm.item():.4f} delta={loss_delta.item():.4f} "
@@ -1300,8 +1367,6 @@ def train(config):
                             f'step_{global_step:06d}_degraded_{sample_noise_type}_{i}.png'))
 
                 model.train()
-
-            global_step += 1
 
         # ============================================================
         # End of epoch: Validation

@@ -225,10 +225,10 @@ noise_layer:
     # Curriculum stage 1: stabilize robust fine-tuning on gentler layers first.
     # Stage 2 suggestion: add mild LED after the first diagnostic run is stable.
     # Stage 3 suggestion: add projector only after LED remains stable.
-    candidates: [pimog, oled]
-    probs: [0.70, 0.30]
+    candidates: [pimog, oled, led, projector]
+    probs: [0.25, 0.25, 0.25, 0.25]
 
 output:
-  checkpoint_dir: ./checkpoints_stage2_mixed
-  sample_dir: ./outputs_stage2_mixed/samples
-  log_dir: ./outputs_stage2_mixed/logs
+  checkpoint_dir: ./checkpoints_stage2_amp_full_mixed_uniform
+  sample_dir: ./outputs_stage2_amp_full_mixed_uniform/samples
+  log_dir: ./outputs_stage2_amp_full_mixed_uniform/logs

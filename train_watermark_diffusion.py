@@ -985,7 +985,7 @@ def train(config):
 
                 # Unified degradation layers use [0, 1].
                 pred_x0_01 = ((pred_x0 + 1.0) / 2.0).clamp(1e-6, 1.0 - 1e-6)
-                cover_01_for_loss = (cover_img_fp32 + 1.0) / 2.0
+                cover_01_for_loss = ((cover_img_fp32 + 1.0) / 2.0).clamp(0.0, 1.0)
                 residual_01 = pred_x0_01 - cover_01_for_loss
                 loss_tv = residual_tv_loss(residual_01)
                 loss_topk = residual_topk_loss(

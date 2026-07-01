@@ -229,6 +229,6 @@ noise_layer:
     probs: [0.70, 0.30]
 
 output:
-  checkpoint_dir: ./checkpoints_stage2_mixed
-  sample_dir: ./outputs_stage2_mixed/samples
-  log_dir: ./outputs_stage2_mixed/logs
+  checkpoint_dir: ./checkpoints_stage2_amp_pimog_oled
+  sample_dir: ./outputs_stage2_amp_pimog_oled/samples
+  log_dir: ./outputs_stage2_amp_pimog_oled/logs

@@ -109,42 +109,46 @@ noise_layer:
 
   oled:
     p: 1.0
+    train_safe: true
+    debug_finite: false
+    sensor_noise_eps: 0.0001
+    final_nan_to_num: true
     subpixel_mode: pentile
     enable_tone: true
     enable_subpixel: true
     enable_display_blur: true
-    enable_perspective: true
+    enable_perspective: false
     enable_camera_blur: true
-    enable_banding: true
+    enable_banding: false
     enable_view_color_shift: true
     enable_noise: true
-    enable_reflection: true
+    enable_reflection: false
     enable_resample: false
     use_jpeg: false
-    gamma_range: [0.85, 1.25]
-    contrast_range: [1.05, 1.35]
-    saturation_range: [1.05, 1.45]
-    black_crush_range: [0.00, 0.08]
-    highlight_clip_prob: 0.30
-    highlight_clip_range: [0.92, 1.00]
-    brightness_jitter: 0.03
-    color_gain_range: [0.96, 1.04]
-    subpixel_prob: 0.70
-    subpixel_strength_range: [0.03, 0.15]
-    subpixel_blur_sigma_range: [0.20, 0.80]
-    display_blur_sigma_range: [0.20, 0.80]
-    perspective_strength_range: [0.00, 0.018]
-    camera_blur_sigma_range: [0.40, 1.50]
-    banding_prob: 0.50
-    banding_strength_range: [0.015, 0.080]
-    banding_frequency_range: [4.0, 32.0]
-    banding_tilt_range: [-0.15, 0.15]
-    view_color_shift_prob: 0.50
-    view_color_shift_strength_range: [0.01, 0.08]
-    reflection_prob: 0.35
-    reflection_strength_range: [0.02, 0.12]
-    haze_strength_range: [0.00, 0.06]
-    noise_std_range: [0.002, 0.020]
+    gamma_range: [0.90, 1.15]
+    contrast_range: [1.00, 1.20]
+    saturation_range: [1.00, 1.25]
+    black_crush_range: [0.00, 0.03]
+    highlight_clip_prob: 0.10
+    highlight_clip_range: [0.95, 1.00]
+    brightness_jitter: 0.02
+    color_gain_range: [0.98, 1.02]
+    subpixel_prob: 0.50
+    subpixel_strength_range: [0.02, 0.08]
+    subpixel_blur_sigma_range: [0.20, 0.50]
+    display_blur_sigma_range: [0.20, 0.60]
+    perspective_strength_range: [0.00, 0.008]
+    camera_blur_sigma_range: [0.30, 1.00]
+    banding_prob: 0.20
+    banding_strength_range: [0.005, 0.025]
+    banding_frequency_range: [4.0, 16.0]
+    banding_tilt_range: [-0.08, 0.08]
+    view_color_shift_prob: 0.40
+    view_color_shift_strength_range: [0.005, 0.035]
+    reflection_prob: 0.10
+    reflection_strength_range: [0.00, 0.04]
+    haze_strength_range: [0.00, 0.02]
+    noise_std_range: [0.001, 0.010]
     motion_blur_prob: 0.20
     motion_blur_kernel_range: [3, 9]
     resample_scale_range: [0.92, 1.08]

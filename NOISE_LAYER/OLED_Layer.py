@@ -64,6 +64,10 @@ class OLED_Layer(nn.Module):
         motion_blur_kernel_range=(3, 9),
         resample_scale_range=(0.92, 1.08),
         jpeg_quality_range=(55.0, 95.0),
+        train_safe=False,
+        debug_finite=False,
+        sensor_noise_eps=1e-4,
+        final_nan_to_num=True,
         **kwargs,
     ):
         super().__init__()
@@ -109,10 +113,48 @@ class OLED_Layer(nn.Module):
             motion_blur_kernel_range=motion_blur_kernel_range,
             resample_scale_range=resample_scale_range,
             jpeg_quality_range=jpeg_quality_range,
+            train_safe=train_safe,
+            debug_finite=debug_finite,
+            sensor_noise_eps=sensor_noise_eps,
+            final_nan_to_num=final_nan_to_num,
         )
         if config is not None:
             params.update(dict(config))
         params.update(kwargs)
+
+        if bool(params.get("train_safe", False)):
+            safe_defaults = {
+                "enable_perspective": False,
+                "enable_banding": False,
+                "enable_reflection": False,
+                "enable_resample": False,
+                "use_jpeg": False,
+                "gamma_range": (0.90, 1.15),
+                "contrast_range": (1.00, 1.20),
+                "saturation_range": (1.00, 1.25),
+                "black_crush_range": (0.00, 0.03),
+                "highlight_clip_prob": 0.10,
+                "highlight_clip_range": (0.95, 1.00),
+                "brightness_jitter": 0.02,
+                "color_gain_range": (0.98, 1.02),
+                "subpixel_prob": 0.50,
+                "subpixel_strength_range": (0.02, 0.08),
+                "subpixel_blur_sigma_range": (0.20, 0.50),
+                "display_blur_sigma_range": (0.20, 0.60),
+                "perspective_strength_range": (0.00, 0.008),
+                "camera_blur_sigma_range": (0.30, 1.00),
+                "banding_prob": 0.20,
+                "banding_strength_range": (0.005, 0.025),
+                "banding_frequency_range": (4.0, 16.0),
+                "banding_tilt_range": (-0.08, 0.08),
+                "view_color_shift_prob": 0.40,
+                "view_color_shift_strength_range": (0.005, 0.035),
+                "reflection_prob": 0.10,
+                "reflection_strength_range": (0.00, 0.04),
+                "haze_strength_range": (0.00, 0.02),
+                "noise_std_range": (0.001, 0.010),
+            }
+            params.update(safe_defaults)
 
         # Backward-compatible aliases from the first OLED implementation.
         if "gamma_min" in params or "gamma_max" in params:
@@ -148,6 +190,12 @@ class OLED_Layer(nn.Module):
         self.p = float(params.pop("p"))
         if not 0.0 <= self.p <= 1.0:
             raise ValueError("p must be in [0, 1]")
+        self.train_safe = bool(params.pop("train_safe"))
+        self.debug_finite = bool(params.pop("debug_finite"))
+        self.sensor_noise_eps = float(params.pop("sensor_noise_eps"))
+        self.final_nan_to_num = bool(params.pop("final_nan_to_num"))
+        if self.sensor_noise_eps <= 0.0:
+            raise ValueError("sensor_noise_eps must be positive")
 
         for key in (
             "enable_tone",
@@ -218,6 +266,25 @@ class OLED_Layer(nn.Module):
         )
         return yy, xx
 
+    def _safe_clamp01(self, x):
+        x = torch.nan_to_num(x, nan=0.5, posinf=1.0, neginf=0.0)
+        return x.clamp(0.0, 1.0)
+
+    def _check_finite(self, name, x):
+        if not self.debug_finite:
+            return x
+        if not torch.isfinite(x).all():
+            nan_count = torch.isnan(x).sum().item()
+            inf_count = torch.isinf(x).sum().item()
+            finite_x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+            x_min = finite_x.min().item()
+            x_max = finite_x.max().item()
+            raise FloatingPointError(
+                f"[OLED NonFinite] after={name}, nan={nan_count}, "
+                f"inf={inf_count}, min={x_min:.6f}, max={x_max:.6f}"
+            )
+        return x
+
     def _apply_oled_tone(self, x):
         # OLED display response: high saturation / contrast, deep blacks and
         # mild highlight roll-off or clipping before camera capture.
@@ -232,7 +299,9 @@ class OLED_Layer(nn.Module):
         gain = sample_uniform(x, self.color_gain_range, (batch, 3, 1, 1))
 
         x = x.clamp(1e-6, 1.0).pow(gamma)
+        x = self._safe_clamp01(x)
         x = ((x - black).clamp_min(0.0) / (1.0 - black).clamp_min(1e-4)).pow(1.04)
+        x = self._safe_clamp01(x)
         mean = x.mean(dim=(2, 3), keepdim=True)
         x = (x - mean) * contrast + mean + brightness
         luma = 0.299 * x[:, 0:1] + 0.587 * x[:, 1:2] + 0.114 * x[:, 2:3]
@@ -243,7 +312,7 @@ class OLED_Layer(nn.Module):
             x = clip * torch.tanh(x / clip.clamp_min(1e-4))
         else:
             x = x - 0.10 * (x - 1.0).clamp_min(0.0)
-        return x.clamp(0.0, 1.0)
+        return self._safe_clamp01(x)
 
     def _apply_subpixel_pentile(self, x):
         # PenTile / stripe masks make high-contrast edges show subtle colored
@@ -362,7 +431,9 @@ class OLED_Layer(nn.Module):
         if not self.enable_noise:
             return x
         std = sample_uniform(x, self.noise_std_range, (x.shape[0], 1, 1, 1))
-        shot = torch.randn_like(x) * std * x.clamp_min(0.0).sqrt()
+        safe_x = x.clamp(0.0, 1.0)
+        shot_scale = (safe_x + self.sensor_noise_eps).sqrt()
+        shot = torch.randn_like(x) * std * shot_scale
         read = torch.randn_like(x) * (0.45 * std)
         return x + shot + read
 
@@ -446,20 +517,34 @@ class OLED_Layer(nn.Module):
         if self.p == 0.0 or (self.p < 1.0 and torch.rand((), device=x.device) >= self.p):
             return clean.to(dtype=x.dtype)
 
-        y = clean
+        y = self._check_finite("input_clean", clean)
         if self.enable_tone:
             y = self._apply_oled_tone(y)
+            y = self._check_finite("tone", y)
         y = self._apply_subpixel_pentile(y)
+        y = self._check_finite("subpixel", y)
         y = self._apply_display_blur(y)
+        y = self._check_finite("display_blur", y)
         y = self._apply_perspective(y)
+        y = self._check_finite("perspective", y)
         y = self._apply_camera_blur(y)
+        y = self._check_finite("camera_blur", y)
         y = self._apply_pwm_banding(y)
+        y = self._check_finite("banding", y)
         y = self._apply_view_color_shift(y)
+        y = self._check_finite("view_color_shift", y)
         y = self._apply_sensor_noise(y)
+        y = self._check_finite("sensor_noise", y)
         y = self._apply_motion_blur(y)
+        y = self._check_finite("motion_blur", y)
         y = self._apply_reflection_haze(y)
+        y = self._check_finite("reflection_haze", y)
         y = self._apply_resample(y)
+        y = self._check_finite("resample", y)
         y = self._apply_jpeg_proxy(y)
+        y = self._check_finite("jpeg_proxy", y)
+        if self.final_nan_to_num:
+            y = torch.nan_to_num(y, nan=0.5, posinf=1.0, neginf=0.0)
         return y.clamp(0.0, 1.0).to(dtype=x.dtype)
 
 

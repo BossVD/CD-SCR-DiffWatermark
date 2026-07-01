@@ -206,7 +206,7 @@ noise_layer:
 
   mixed:
     candidates: [pimog, oled, led, projector]
-    probs: [0.15, 0.30, 0.30, 0.25]
+    probs: [0.25, 0.20, 0.20, 0.25]
 
 output:
   checkpoint_dir: ./checkpoints_stage2_mixed
